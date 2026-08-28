@@ -21,8 +21,14 @@ DRILL_ROW_CAP = 100
 
 # Columns shown when drilling into comparison rows.
 COMPARISON_COLUMNS = [
-    "doc_id", "field", "tier", "extracted_value", "filed_value",
-    "status", "reason", "confidence", "country", "source_system",
+    "doc_id", "level", "field", "item_no_extracted", "item_no_filed", "tier",
+    "extracted_value", "filed_value", "status", "reason", "confidence",
+    "country", "source_system",
+]
+# For drills into item alignment outcomes, the pairing justification matters.
+STRUCTURE_COLUMNS = [
+    "doc_id", "field", "item_no_extracted", "item_no_filed",
+    "extracted_value", "filed_value", "reason", "country", "source_system",
 ]
 DOC_COLUMNS_BASE = ["doc_id", "country", "source_system"]
 
@@ -117,7 +123,7 @@ def _headline(ev: Evaluation, dd: _Drilldowns) -> str:
     dirty_docs = ev.doc_summary[~ev.doc_summary["clean"]]
     doc_cols = DOC_COLUMNS_BASE + [
         c for c in ev.doc_summary.columns if c.endswith("_mismatches")
-    ] + ["min_critical_confidence"]
+    ] + ["missed_items", "spurious_items", "min_critical_confidence"]
     critical_mismatch_rows = comparisons[
         (comparisons["status"] == MISMATCH) & (comparisons["tier"] == tier)
     ]
@@ -170,6 +176,60 @@ def _join_note(ev: Evaluation, dd: _Drilldowns) -> str:
     return " &middot; ".join(parts)
 
 
+def _alignment_section(ev: Evaluation, dd: _Drilldowns) -> str:
+    comparisons = ev.comparisons
+    structure = comparisons[comparisons["level"] == "structure"]
+    body = []
+    for _, row in ev.alignment_summary.iterrows():
+        system = row["source_system"]
+        missed = structure[
+            (structure["field"] == "missed_item") & (structure["source_system"] == system)
+        ]
+        spurious = structure[
+            (structure["field"] == "spurious_item") & (structure["source_system"] == system)
+        ]
+        defect_docs = ev.doc_summary[
+            (ev.doc_summary["source_system"] == system)
+            & ((ev.doc_summary["missed_items"] > 0) | (ev.doc_summary["spurious_items"] > 0))
+        ]
+        doc_cols = DOC_COLUMNS_BASE + [
+            "extracted_items", "filed_items", "paired_items", "missed_items", "spurious_items",
+        ]
+        body.append([
+            esc(system),
+            f"{int(row['documents']):,}",
+            f"{int(row['extracted_items']):,}",
+            f"{int(row['filed_items']):,}",
+            f"{int(row['paired_items']):,}",
+            dd.link(f"{int(row['missed_items']):,}",
+                    f"Filed items with no extracted counterpart: {system}",
+                    missed, STRUCTURE_COLUMNS),
+            dd.link(f"{int(row['spurious_items']):,}",
+                    f"Extracted items with no filed counterpart: {system}",
+                    spurious, STRUCTURE_COLUMNS),
+            dd.link(f"{int(row['docs_with_structure_defects']):,}",
+                    f"Documents with structural defects: {system}",
+                    defect_docs, doc_cols),
+        ])
+    table = _raw_table(
+        ["source system", "documents", "extracted items", "filed items",
+         "paired", "missed items", "spurious items", "docs with defects"],
+        body,
+    )
+    return (
+        "<section><h2>Goods item alignment</h2>"
+        "<p>Declarations are multi-item, and item numbers cannot be joined on "
+        "&mdash; extraction and filing number lines independently.  Items are "
+        "paired by content (HS code hierarchy, value, origin, quantity; see "
+        "alignment.py), and every pairing carries its stated basis in the "
+        "drill-downs.  A <em>missed</em> item was filed but never extracted "
+        "(a dropped or merged line); a <em>spurious</em> item was extracted "
+        "but never filed (a subtotal or footer read as goods).  Both count "
+        "as mismatches at the tier configured in field_tiers.yaml.</p>"
+        f"{table}</section>"
+    )
+
+
 def _straight_through_section(ev: Evaluation, dd: _Drilldowns) -> str:
     ds = ev.doc_summary
     confidence = ds["min_critical_confidence"]
@@ -203,9 +263,12 @@ def _straight_through_section(ev: Evaluation, dd: _Drilldowns) -> str:
         "<section><h2>Straight-through processing estimate</h2>"
         "<p>If every document whose critical-tier fields all carry at least this "
         "confidence were accepted without human review: how much goes straight "
-        "through, and how many bad documents ride along.  Escapes are measured "
-        "against the filed record, so legitimate post-filing amendments are "
-        "counted as escapes &mdash; treat the escape rate as an upper bound.</p>"
+        "through, and how many bad documents ride along.  Two honest caveats. "
+        "Escapes are measured against the filed record, so legitimate post-filing "
+        "amendments count as escapes &mdash; treat the rate as an upper bound. "
+        "And the gate only sees per-field confidence: a document whose extraction "
+        "silently dropped a goods item still auto-accepts, because the missing "
+        "line has no score to be low.  That is how real confidence gates fail.</p>"
         f"{table}</section>"
     )
 
@@ -260,6 +323,7 @@ def _per_field_section(ev: Evaluation, dd: _Drilldowns) -> str:
         ]
         body.append([
             esc(field),
+            esc(row["level"]),
             str(row["tier"]),
             esc(row["comparator"]),
             f"{int(row['matches']):,}",
@@ -274,7 +338,7 @@ def _per_field_section(ev: Evaluation, dd: _Drilldowns) -> str:
             _pct(row["recall"]),
         ])
     table = _raw_table(
-        ["field", "tier", "comparator", "matches", "mismatches",
+        ["field", "level", "tier", "comparator", "matches", "mismatches",
          "missing extracted", "unparseable", "precision", "recall"],
         body,
     )
@@ -283,7 +347,9 @@ def _per_field_section(ev: Evaluation, dd: _Drilldowns) -> str:
         "<p>Precision: when the tool extracted a value and the filing has one, "
         "how often they agree.  Recall: of the values present in the filing, "
         "how often the tool produced a matching one (so a field the tool "
-        "skipped hurts recall, not precision).</p>"
+        "skipped hurts recall, not precision).  Item-level fields aggregate "
+        "over aligned item pairs; unmatched items are counted in the "
+        "alignment section above, not here.</p>"
         f"{table}</section>"
     )
 
@@ -337,7 +403,9 @@ def _worst_mismatches_section(ev: Evaluation) -> str:
         "<section><h2>50 worst mismatches</h2>"
         "<p>Worst = lowest tier first (most critical), then highest extraction "
         "confidence &mdash; a confidently wrong value is more dangerous than a "
-        "hesitantly wrong one, because no review queue will catch it.</p>"
+        "hesitantly wrong one, because no review queue will catch it.  Missed "
+        "and spurious items carry no confidence, so they sort to the end of "
+        "their tier here; the alignment section lists them all.</p>"
         f"{_table(worst, COMPARISON_COLUMNS)}</section>"
     )
 
@@ -353,7 +421,8 @@ def _validity_section(validity: pd.DataFrame | None, dd: _Drilldowns) -> str:
             esc(rule),
             f"{checked:,}",
             dd.link(f"{len(failures):,}", f"Validity failures: {rule}",
-                    failures, ["doc_id", "country", "source_system", "reason"]),
+                    failures,
+                    ["doc_id", "item_number", "country", "source_system", "reason"]),
             _pct(len(failures) / checked if checked else None),
         ])
     table = _raw_table(["rule", "records checked", "failures", "failure rate"], body)
@@ -376,6 +445,11 @@ def _caveats_section(extra_notes: list[str] | None) -> str:
         "When extraction and filing agree, they can both be wrong.  Agreement "
         "measures consistency, not correctness; only the validity rules catch "
         "some of these cases.",
+        "Item alignment is a greedy heuristic, not truth.  Two same-chapter "
+        "items with similar values can pair the wrong way round, and a merged "
+        "line whose totals happen to equal one filed item pairs cleanly while "
+        "the other filed item is reported missed.  Every pairing's stated "
+        "basis is in the drill-downs so a human can audit it.",
         "Ambiguous dates (day and month both &le; 12) are resolved by the "
         "configured day-first preference, which can itself be wrong.  Mismatch "
         "reasons flag when a difference would vanish with the order swapped.",
@@ -461,6 +535,7 @@ def build_report(
     generated_at = generated_at or datetime.now()
     sections = [
         _headline(evaluation, dd),
+        _alignment_section(evaluation, dd),
         _straight_through_section(evaluation, dd),
         _calibration_section(evaluation, dd),
         _per_field_section(evaluation, dd),

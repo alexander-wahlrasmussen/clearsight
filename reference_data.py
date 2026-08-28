@@ -58,6 +58,49 @@ COUNTRY_ALIASES: dict[str, str] = {
     "MEXICO": "MX",
 }
 
+# National EORI number lengths: digits after the two-letter country prefix.
+# These lengths are real (DE issues 15-digit numbers, NL uses the 9-digit
+# RSIN); the Luhn check digit our validity rule expects at the end is NOT --
+# see validity.eori_checksum.  A prefix missing from this map means we do
+# not know the national format and the rule fails rather than guesses.
+EORI_FORMATS: dict[str, int] = {
+    "DE": 15,
+    "NL": 9,
+}
+
+# Expected supplementary quantity unit by HS chapter (first two digits).
+# Real declarations owe customs a quantity in the unit the nomenclature
+# prescribes -- footwear in pairs, beverages in litres, most bulk goods as
+# net mass.  This map is a plausible working subset of that idea, not the
+# real (per-code, per-year) unit table.
+CHAPTER_QUANTITY_UNITS: dict[str, str] = {
+    "09": "KGM", "19": "KGM", "21": "KGM",   # coffee, baked goods, food preps
+    "22": "LTR",                              # beverages
+    "33": "KGM", "39": "KGM",                 # cosmetics, plastics
+    "42": "NAR",                              # bags and cases
+    "48": "KGM", "49": "KGM",                 # paper, printed matter
+    "61": "NAR", "62": "NAR", "63": "NAR",    # apparel and textiles
+    "64": "NPR",                              # footwear: pairs
+    "73": "KGM",                              # articles of iron/steel
+    "83": "NAR", "84": "NAR", "85": "NAR",    # metal fittings, machinery, electronics
+    "87": "NAR", "90": "NAR",                 # vehicles/parts, instruments
+    "94": "NAR", "95": "NAR", "96": "NAR",    # furniture, toys, misc
+}
+DEFAULT_QUANTITY_UNIT = "KGM"  # weight-based when the chapter is not listed
+VALID_QUANTITY_UNITS: frozenset[str] = frozenset({"KGM", "NAR", "NPR", "LTR"})
+
+
+def expected_quantity_unit(hs_code: str | None) -> str | None:
+    """The supplementary unit the HS chapter prescribes, or None when the
+    code is unusable (no chapter to look up)."""
+    if not hs_code:
+        return None
+    chapter = str(hs_code).strip()[:2]
+    if not chapter.isdigit():
+        return None
+    return CHAPTER_QUANTITY_UNITS.get(chapter, DEFAULT_QUANTITY_UNIT)
+
+
 # Common ISO 4217 currency codes.  A working subset, not the full registry;
 # a currency missing from this list fails the validity rule, which is the
 # honest behaviour for a prototype (better a false alarm a human can waive

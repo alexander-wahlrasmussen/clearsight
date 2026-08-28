@@ -16,24 +16,22 @@ import evaluate
 import generate_synthetic
 import report
 import validity
-from readers import READERS, globex_xml
+from readers import READERS
 
 HERE = Path(__file__).parent
 
 
 def run_validity(extracted, data_dir: Path) -> pd.DataFrame:
-    """Record-level rules on every extracted record, plus the line-sum rule
-    fed from the raw Globex XML (line items are not part of the canonical
-    record -- see validity.py)."""
+    """Header rules per record and item rules per goods item, on the
+    extracted side only -- no ground truth involved."""
     tariff = validity.load_tariff_codes(data_dir / "tariff_codes.csv")
-    by_id = {record.doc_id: record for record in extracted}
-
     rows = []
     for record in extracted:
         for result in validity.run_record_rules(record, tariff):
             rows.append(
                 {
                     "doc_id": record.doc_id,
+                    "item_number": result.item_number,
                     "country": record.country,
                     "source_system": record.source_system,
                     "rule": result.rule,
@@ -41,20 +39,6 @@ def run_validity(extracted, data_dir: Path) -> pd.DataFrame:
                     "reason": result.reason,
                 }
             )
-    lines_by_doc = globex_xml.read_invoice_lines(data_dir / "extracted_globex.xml")
-    for doc_id, (amounts, total) in lines_by_doc.items():
-        result = validity.invoice_lines_sum_to_total(amounts, total)
-        record = by_id.get(doc_id)
-        rows.append(
-            {
-                "doc_id": doc_id,
-                "country": record.country if record else None,
-                "source_system": globex_xml.SOURCE_SYSTEM,
-                "rule": result.rule,
-                "passed": result.passed,
-                "reason": result.reason,
-            }
-        )
     return pd.DataFrame(rows)
 
 
@@ -71,7 +55,8 @@ def main() -> None:
     print("[1/5] Generating synthetic data")
     summary = generate_synthetic.generate(n_docs=args.docs, seed=args.seed, data_dir=data_dir)
     print(
-        f"      {summary['n_acme']} Acme CSV + {summary['n_globex']} Globex XML documents; "
+        f"      {summary['n_acme']} Acme CSV + {summary['n_globex']} Globex XML documents "
+        f"({summary['n_items']} goods items); "
         f"{summary['n_amended_docs']} legitimately amended after filing"
     )
 
@@ -79,7 +64,11 @@ def main() -> None:
     extracted = READERS["acme_extract"](data_dir / "extracted_acme.csv")
     extracted += READERS["globex_capture"](data_dir / "extracted_globex.xml")
     filed = READERS["customs_ledger"](data_dir / "filed_customs_ledger.csv")
-    print(f"      {len(extracted)} extracted records, {len(filed)} filed records")
+    n_items = sum(len(r.items) for r in extracted)
+    print(
+        f"      {len(extracted)} extracted records ({n_items} items), "
+        f"{len(filed)} filed records"
+    )
 
     print("[3/5] Running validity rules (no ground truth needed)")
     validity_df = run_validity(extracted, data_dir)
@@ -88,13 +77,19 @@ def main() -> None:
     failures.to_csv(out_dir / "validity_failures.csv", index=False)
     print(f"      {len(validity_df)} checks run, {len(failures)} failures")
 
-    print("[4/5] Evaluating extracted vs filed")
+    print("[4/5] Evaluating extracted vs filed (aligning goods items, comparing fields)")
     tiers = evaluate.load_field_tiers(HERE / "field_tiers.yaml")
     evaluation = evaluate.evaluate(extracted, filed, tiers)
     evaluate.write_outputs(evaluation, out_dir)
+    align = evaluation.alignment_summary
     print(
         f"      clean document rate: {evaluation.clean_document_rate * 100:.1f}% "
         f"({evaluation.n_joined} documents compared)"
+    )
+    print(
+        f"      item alignment: {int(align['paired_items'].sum())} paired, "
+        f"{int(align['missed_items'].sum())} missed, "
+        f"{int(align['spurious_items'].sum())} spurious"
     )
 
     print("[5/5] Building report")

@@ -1,30 +1,43 @@
-"""Generate a few thousand paired (extracted, filed) records with realistic,
-deliberately injected error patterns.
+"""Generate a few thousand paired (extracted, filed) multi-item declarations
+with realistic, deliberately injected error patterns.
 
 The generator knows the ground truth; the harness never sees it.  The one
 piece of truth written to disk is the amendments sidecar
-(data/amendments_truth.csv): documents where the FILED value was
-legitimately changed after filing (a revaluation, a corrected count, a
-reclassification).  Those show up to the harness as mismatches that are
-NOT extraction errors -- exactly the ambiguity a real deployment faces.
-evaluate.py never reads that file; it exists so a human can check how much
-of the measured error rate the ambiguity accounts for.
+(data/amendments_truth.csv): values the FILED side legitimately changed
+after filing (revaluations, corrected counts, reclassifications).  Those
+show up to the harness as mismatches that are NOT extraction errors --
+exactly the ambiguity a real deployment faces.  evaluate.py never reads
+that file; it exists so a human can check how much of the measured error
+rate the ambiguity accounts for.
 
-Injected extraction error patterns:
-  - OCR digit confusion in declared value, weights, EORI and BL reference
-  - HS codes truncated to 6 digits (valid internationally, invalid on an
-    EU declaration) or with one misread digit
+Population: declarations filed in Germany and the Netherlands, 1-5 goods
+items each, with multi-item documents sometimes drawing several items from
+the same HS chapter (that is what real invoices look like, and it is what
+makes item alignment genuinely hard).  NL documents are systematically
+~2.5x worse -- a worse scan lane, nothing about the country itself.
+
+Injected FIELD error patterns:
+  - OCR digit confusion in the invoice total, item values, weights, EORI
+    and BL reference
+  - HS codes truncated to 6 digits or with one misread digit
   - day/month swapped in the invoice date (the DD/MM vs MM/DD classic)
-  - missing origin country
+  - missing origin country, wrong supplementary unit
   - incoterm and currency confusion
   - net weight exceeding gross (caught by validity, no ground truth needed)
-  - invoice line amounts not summing to the total (Globex XML only)
-  - one country (TR) whose extraction is systematically ~3x worse, because
-    someone always has worse scans
+
+Injected STRUCTURAL error patterns (the reason this harness is multi-item):
+  - a dropped goods item (the last line falls off a page break)
+  - two same-chapter items merged into one (values/quantities summed)
+  - a spurious item: the invoice's subtotal line read as goods
+
+A drop or a spurious line breaks the items-sum-to-total arithmetic, so
+validity can catch it before filing; a merge preserves the sum and cannot
+be caught that way -- deliberately.
 
 Confidence scores are generated to be *imperfectly* honest: corrupted
 fields tend to get lower confidence, but the distributions overlap, so the
-calibration table has something real to show.
+calibration table has something real to show.  Dropped items produce no
+low score anywhere -- a confidence gate cannot see what is not there.
 """
 
 from __future__ import annotations
@@ -33,10 +46,11 @@ import argparse
 import csv
 import random
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+from reference_data import EORI_FORMATS, VALID_QUANTITY_UNITS, expected_quantity_unit
 from validity import luhn_check_digit
 
 ACME = "acme_extract"
@@ -44,14 +58,18 @@ GLOBEX = "globex_capture"
 
 # --- population shape ------------------------------------------------------
 
-COUNTRY_WEIGHTS = {"DE": 0.24, "FR": 0.20, "NL": 0.15, "ES": 0.14, "PL": 0.14, "TR": 0.13}
-BAD_COUNTRY = "TR"          # scans from TR are systematically worse
-BAD_COUNTRY_MULTIPLIER = 3.0
+COUNTRY_WEIGHTS = {"DE": 0.58, "NL": 0.42}
+BAD_COUNTRY = "NL"          # scans from the NL lane are systematically worse
+BAD_COUNTRY_MULTIPLIER = 2.5
 
 ORIGIN_COUNTRIES = ["CN", "US", "IN", "VN", "TR", "GB", "JP", "KR", "TW", "TH", "MY", "MX"]
 CURRENCY_WEIGHTS = {"EUR": 0.80, "USD": 0.15, "GBP": 0.05}
 INCOTERMS = ["EXW", "FOB", "CIF", "CFR", "DAP", "DDP", "FCA"]
 CARRIER_PREFIXES = ["MSCU", "MAEU", "HLCU", "CMDU", "ONEY", "COSU"]
+
+# Goods items per declaration: mostly small, occasionally busy.
+N_ITEMS_WEIGHTS = {1: 0.45, 2: 0.25, 3: 0.15, 4: 0.10, 5: 0.05}
+SAME_CHAPTER_DOC_SHARE = 0.35  # multi-item docs drawing all items from one chapter
 
 # Plausible 10-digit TARIC-style codes; the tariff list is derived from these.
 HS_POOL = [
@@ -67,25 +85,37 @@ TARIFF_DECOYS = [
     "7208395000", "8409910000", "8703231900", "9401710000", "9506910010",
 ]
 
+_POOL_BY_CHAPTER: dict[str, list[str]] = {}
+for _code in HS_POOL:
+    _POOL_BY_CHAPTER.setdefault(_code[:2], []).append(_code)
+_MERGEABLE_CHAPTERS = [c for c, codes in _POOL_BY_CHAPTER.items() if len(codes) >= 2]
+
 # --- error rates (base; multiplied for BAD_COUNTRY) ------------------------
 
 RATES = {
-    "value_ocr": 0.05,        # digit confusion in declared_value
-    "weight_ocr": 0.03,       # digit confusion in gross or net weight
-    "hs_truncate": 0.04,      # HS code truncated to 6 digits
-    "hs_digit": 0.02,         # one HS digit misread
-    "date_swap": 0.08,        # day/month swapped (only possible when day <= 12)
-    "origin_missing": 0.06,   # origin country not extracted
+    # header-level, per document
+    "total_ocr": 0.03,        # digit confusion in the printed invoice total
     "currency_wrong": 0.015,
     "eori_digit": 0.02,
     "bl_ocr": 0.05,           # O/0, I/1, B/8, S/5 confusion in BL reference
     "incoterm_confusion": 0.02,
+    "date_swap": 0.08,        # day/month swapped (only possible when day <= 12)
+    # item-level, per goods item
+    "item_value_ocr": 0.04,
+    "hs_truncate": 0.03,      # HS code truncated to 6 digits
+    "hs_digit": 0.015,        # one HS digit misread
+    "origin_missing": 0.05,
     "quantity_slip": 0.02,
-    "package_off_by_one": 0.02,
-    "net_exceeds_gross": 0.015,
-    "line_sum_error": 0.03,   # Globex XML only: a line amount misread
+    "unit_wrong": 0.02,       # quantity read against the wrong unit
+    "weight_ocr": 0.025,
+    "net_exceeds_gross": 0.012,
+    "package_off_by_one": 0.015,
+    # structural, per document
+    "drop_item": 0.025,       # last line falls off a page break (needs >= 2 items)
+    "merge_items": 0.02,      # two same-chapter lines read as one (needs candidates)
+    "spurious_item": 0.012,   # subtotal line read as a goods item
 }
-AMENDMENT_RATE = 0.04         # per document; NOT an extraction error
+AMENDMENT_RATE = 0.05         # per document; NOT an extraction error
 
 OCR_DIGIT_CONFUSION = {"0": "8", "1": "7", "2": "7", "3": "8", "4": "9",
                        "5": "6", "6": "5", "7": "1", "8": "3", "9": "4"}
@@ -96,11 +126,29 @@ INCOTERM_CONFUSION = {"CIF": "CFR", "CFR": "CIF", "FOB": "FCA", "FCA": "FOB",
 CURRENCY_CONFUSION = {"EUR": "USD", "USD": "EUR", "GBP": "EUR"}
 
 # Fields that carry an extraction confidence score.
-CONFIDENCE_FIELDS = [
-    "hs_code", "declared_value", "currency", "origin_country", "importer_eori",
-    "quantity", "gross_weight", "net_weight", "invoice_date", "incoterm",
-    "package_count", "bl_reference",
+HEADER_CONFIDENCE_FIELDS = [
+    "declared_value", "currency", "importer_eori", "incoterm",
+    "invoice_date", "bl_reference",
 ]
+ITEM_CONFIDENCE_FIELDS = [
+    "hs_code", "origin_country", "item_value", "quantity", "quantity_unit",
+    "net_weight", "gross_weight", "package_count",
+]
+
+
+@dataclass
+class TrueItem:
+    """One goods item as it actually was on the paper."""
+
+    item_number: int
+    hs_code: str
+    origin_country: str
+    quantity: float
+    quantity_unit: str
+    item_value: float
+    gross_weight: float
+    net_weight: float
+    package_count: int
 
 
 @dataclass
@@ -111,19 +159,13 @@ class TrueDoc:
     shipment_id: str
     country: str
     source_system: str
-    hs_code: str
-    declared_value: float
     currency: str
-    origin_country: str
-    quantity: int
-    gross_weight: float
-    net_weight: float
-    package_count: int
     incoterm: str
     importer_eori: str
     bl_reference: str
     invoice_date: date
-    line_amounts: list[float]
+    invoice_total: float  # always the exact sum of item values
+    items: list[TrueItem]
     extracted_at: datetime
     filed_at: datetime
 
@@ -133,25 +175,50 @@ class TrueDoc:
 # ---------------------------------------------------------------------------
 
 
-def _weighted_choice(rng: random.Random, weights: dict[str, float]) -> str:
+def _weighted_choice(rng: random.Random, weights: dict) -> object:
     return rng.choices(list(weights), weights=list(weights.values()), k=1)[0]
 
 
 def _make_eori(rng: random.Random, country: str) -> str:
-    payload = "".join(str(rng.randint(0, 9)) for _ in range(8))
+    """Real national digit counts (see reference_data.EORI_FORMATS), with
+    our synthetic Luhn check digit at the end."""
+    n_digits = EORI_FORMATS[country]
+    payload = "".join(str(rng.randint(0, 9)) for _ in range(n_digits - 1))
     return f"{country}{payload}{luhn_check_digit(payload)}"
 
 
-def _split_into_lines(rng: random.Random, total: float) -> list[float]:
-    """Split an invoice total into 1-4 line amounts that sum exactly to it."""
-    n_lines = rng.randint(1, 4)
-    if n_lines == 1:
-        return [total]
-    cuts = sorted(rng.uniform(0.1, 0.9) for _ in range(n_lines - 1))
-    fractions = [b - a for a, b in zip([0.0] + cuts, cuts + [1.0])]
-    amounts = [round(total * f, 2) for f in fractions[:-1]]
-    amounts.append(round(total - sum(amounts), 2))
-    return amounts
+def _make_true_item(number: int, hs_code: str, rng: random.Random) -> TrueItem:
+    unit = expected_quantity_unit(hs_code)
+    net = round(rng.uniform(2, 4000), 1)
+    if unit == "KGM":
+        quantity = net  # weight-based goods: the supplementary quantity IS net mass
+    elif unit == "NPR":
+        quantity = float(rng.randint(1, 1000))
+    elif unit == "LTR":
+        quantity = round(rng.uniform(10, 10_000), 1)
+    else:  # NAR
+        quantity = float(rng.randint(1, 500))
+    return TrueItem(
+        item_number=number,
+        hs_code=hs_code,
+        origin_country=rng.choice(ORIGIN_COUNTRIES),
+        quantity=quantity,
+        quantity_unit=unit,
+        item_value=round(rng.uniform(300, 80_000), 2),
+        gross_weight=round(net * rng.uniform(1.02, 1.30), 1),
+        net_weight=net,
+        package_count=rng.randint(1, 40),
+    )
+
+
+def _pick_item_codes(n_items: int, rng: random.Random) -> list[str]:
+    """Multi-item invoices often list several lines from one chapter (three
+    kinds of shirt, two computer models).  Same-chapter items are also the
+    ones alignment can genuinely confuse, so they must exist."""
+    if n_items >= 2 and rng.random() < SAME_CHAPTER_DOC_SHARE:
+        chapter_codes = _POOL_BY_CHAPTER[rng.choice(_MERGEABLE_CHAPTERS)]
+        return [rng.choice(chapter_codes) for _ in range(n_items)]
+    return [rng.choice(HS_POOL) for _ in range(n_items)]
 
 
 def _make_true_doc(i: int, rng: random.Random) -> TrueDoc:
@@ -160,26 +227,24 @@ def _make_true_doc(i: int, rng: random.Random) -> TrueDoc:
         invoice_date + timedelta(days=rng.randint(2, 12)),
         time(rng.randint(6, 20), rng.randint(0, 59)),
     )
-    total = round(rng.uniform(500, 250_000), 2)
-    gross = round(rng.uniform(5, 20_000), 1)
+    country = _weighted_choice(rng, COUNTRY_WEIGHTS)
+    n_items = _weighted_choice(rng, N_ITEMS_WEIGHTS)
+    items = [
+        _make_true_item(number, code, rng)
+        for number, code in enumerate(_pick_item_codes(n_items, rng), start=1)
+    ]
     return TrueDoc(
         doc_id=f"DOC-{i:06d}",
         shipment_id=f"SHP-{i:06d}",
-        country=_weighted_choice(rng, COUNTRY_WEIGHTS),
+        country=country,
         source_system=ACME if rng.random() < 0.55 else GLOBEX,
-        hs_code=rng.choice(HS_POOL),
-        declared_value=total,
         currency=_weighted_choice(rng, CURRENCY_WEIGHTS),
-        origin_country=rng.choice(ORIGIN_COUNTRIES),
-        quantity=rng.randint(1, 500),
-        gross_weight=gross,
-        net_weight=round(gross * rng.uniform(0.70, 0.98), 1),
-        package_count=rng.randint(1, 60),
         incoterm=rng.choice(INCOTERMS),
-        importer_eori=_make_eori(rng, _weighted_choice(rng, COUNTRY_WEIGHTS)),
+        importer_eori=_make_eori(rng, country),
         bl_reference=f"{rng.choice(CARRIER_PREFIXES)}{rng.randint(1_000_000, 9_999_999)}",
         invoice_date=invoice_date,
-        line_amounts=_split_into_lines(rng, total),
+        invoice_total=round(sum(item.item_value for item in items), 2),
+        items=items,
         extracted_at=extracted_at,
         filed_at=extracted_at + timedelta(hours=rng.randint(1, 48)),
     )
@@ -213,104 +278,203 @@ def _format_extracted_date(d: date, source_system: str, rng: random.Random) -> s
     day-first or unambiguous -- the injected *error* is a swapped date
     value, not a format choice."""
     if source_system == ACME:
-        fmt = "%d/%m/%Y" if rng.random() < 0.8 else "%d.%m.%Y"
+        fmt = rng.choices(["%d/%m/%Y", "%d.%m.%Y", "%d-%m-%Y"], weights=[70, 15, 15])[0]
     else:
         fmt = "%Y-%m-%d" if rng.random() < 0.7 else "%d/%m/%Y"
     return d.strftime(fmt)
 
 
+@dataclass
+class ExtractedItem:
+    """One goods item as the extraction tool produced it."""
+
+    item_number: int
+    hs_code: str | None
+    origin_country: str | None
+    quantity: float
+    quantity_unit: str
+    item_value: float
+    gross_weight: float
+    net_weight: float
+    package_count: int
+    confidence: dict[str, float]
+
+
+def _corrupt_item(
+    item: TrueItem, rng, hit
+) -> tuple[ExtractedItem, set[str]]:
+    """Field-level corruption of one goods item.  Returns the extracted
+    item (confidence filled in later) and the set of corrupted fields."""
+    values = {
+        "hs_code": item.hs_code,
+        "origin_country": item.origin_country,
+        "quantity": item.quantity,
+        "quantity_unit": item.quantity_unit,
+        "item_value": item.item_value,
+        "gross_weight": item.gross_weight,
+        "net_weight": item.net_weight,
+        "package_count": item.package_count,
+    }
+    corrupted: set[str] = set()
+
+    if hit("item_value_ocr"):
+        values["item_value"] = float(_confuse_digit(f"{item.item_value:.2f}", rng))
+        corrupted.add("item_value")
+    if hit("hs_truncate"):
+        values["hs_code"] = item.hs_code[:6]
+        corrupted.add("hs_code")
+    elif hit("hs_digit"):
+        values["hs_code"] = _confuse_digit(item.hs_code, rng)
+        corrupted.add("hs_code")
+    if hit("origin_missing"):
+        values["origin_country"] = None
+        corrupted.add("origin_country")
+    if hit("quantity_slip"):
+        values["quantity"] = rng.choice(
+            [item.quantity * 10, max(1.0, item.quantity // 10), item.quantity + 1]
+        )
+        corrupted.add("quantity")
+    if hit("unit_wrong"):
+        values["quantity_unit"] = rng.choice(
+            sorted(VALID_QUANTITY_UNITS - {item.quantity_unit})
+        )
+        corrupted.add("quantity_unit")
+    if hit("weight_ocr"):
+        which = rng.choice(["gross_weight", "net_weight"])
+        values[which] = float(_confuse_digit(f"{values[which]:.1f}", rng))
+        corrupted.add(which)
+    if hit("net_exceeds_gross"):
+        values["net_weight"] = round(item.gross_weight * rng.uniform(1.02, 1.15), 1)
+        corrupted.add("net_weight")
+    if hit("package_off_by_one"):
+        values["package_count"] = max(1, item.package_count + rng.choice([-1, 1]))
+        corrupted.add("package_count")
+
+    return ExtractedItem(item_number=item.item_number, confidence={}, **values), corrupted
+
+
+def _merge_candidates(items: list[ExtractedItem]) -> list[int]:
+    """Indexes i where items[i] and items[i+1] share an HS chapter."""
+    return [
+        i
+        for i in range(len(items) - 1)
+        if (items[i].hs_code or "")[:2] == (items[i + 1].hs_code or "")[:2]
+    ]
+
+
 def _corrupt_for_extraction(
     doc: TrueDoc, rng: random.Random
-) -> tuple[dict, dict[str, float], list[float]]:
-    """Return (extracted values, per-field confidence, extracted line amounts)."""
+) -> tuple[dict, dict[str, float], list[ExtractedItem]]:
+    """Return (extracted header, header confidence, extracted items)."""
     multiplier = BAD_COUNTRY_MULTIPLIER if doc.country == BAD_COUNTRY else 1.0
 
     def hit(rate_name: str) -> bool:
         return rng.random() < min(RATES[rate_name] * multiplier, 0.95)
 
-    ext = {
-        "hs_code": doc.hs_code,
-        "declared_value": doc.declared_value,
+    # --- items: field corruption first, then structure -------------------
+    items: list[ExtractedItem] = []
+    corrupted_by_item: list[set[str]] = []
+    for item in doc.items:
+        extracted, corrupted = _corrupt_item(item, rng, hit)
+        items.append(extracted)
+        corrupted_by_item.append(corrupted)
+
+    if len(items) >= 2 and hit("drop_item"):
+        items.pop()          # the last line fell off a page break
+        corrupted_by_item.pop()
+
+    candidates = _merge_candidates(items)
+    if candidates and hit("merge_items"):
+        i = rng.choice(candidates)
+        first, second = items[i], items[i + 1]
+        items[i] = replace(
+            first,
+            quantity=first.quantity + second.quantity,
+            item_value=round(first.item_value + second.item_value, 2),
+            gross_weight=round(first.gross_weight + second.gross_weight, 1),
+            net_weight=round(first.net_weight + second.net_weight, 1),
+            package_count=first.package_count + second.package_count,
+        )
+        items.pop(i + 1)
+        corrupted_by_item[i] = corrupted_by_item[i] | {
+            "quantity", "item_value", "gross_weight", "net_weight", "package_count"
+        }
+        corrupted_by_item.pop(i + 1)
+
+    if hit("spurious_item"):
+        # The invoice's subtotal line, read as one more goods item.
+        template = items[-1]
+        items.append(
+            replace(
+                template,
+                quantity=1.0,
+                item_value=round(sum(it.item_value for it in items), 2),
+                gross_weight=round(sum(it.gross_weight for it in items), 1),
+                net_weight=round(sum(it.net_weight for it in items), 1),
+                package_count=sum(it.package_count for it in items),
+                confidence={},  # replace() would otherwise share template's dict
+            )
+        )
+        corrupted_by_item.append(set(ITEM_CONFIDENCE_FIELDS))
+
+    # Renumber as the extraction tool would: in the order it saw them.
+    for position, item in enumerate(items, start=1):
+        item.item_number = position
+
+    # --- item confidence --------------------------------------------------
+    for item, corrupted in zip(items, corrupted_by_item):
+        for field in ITEM_CONFIDENCE_FIELDS:
+            if getattr(item, field) is None:
+                continue  # nothing extracted, no score reported
+            item.confidence[field] = _confidence_score(field in corrupted, rng)
+
+    # --- header -----------------------------------------------------------
+    header = {
+        "declared_value": doc.invoice_total,
         "currency": doc.currency,
-        "origin_country": doc.origin_country,
-        "importer_eori": doc.importer_eori,
-        "quantity": doc.quantity,
-        "gross_weight": doc.gross_weight,
-        "net_weight": doc.net_weight,
         "incoterm": doc.incoterm,
-        "package_count": doc.package_count,
+        "importer_eori": doc.importer_eori,
         "bl_reference": doc.bl_reference,
     }
-    corrupted: set[str] = set()
-
-    if hit("value_ocr"):
-        ext["declared_value"] = float(_confuse_digit(f"{doc.declared_value:.2f}", rng))
-        corrupted.add("declared_value")
-    if hit("weight_ocr"):
-        which = rng.choice(["gross_weight", "net_weight"])
-        ext[which] = float(_confuse_digit(f"{ext[which]:.1f}", rng))
-        corrupted.add(which)
-    if hit("hs_truncate"):
-        ext["hs_code"] = doc.hs_code[:6]
-        corrupted.add("hs_code")
-    elif hit("hs_digit"):
-        ext["hs_code"] = _confuse_digit(doc.hs_code, rng)
-        corrupted.add("hs_code")
-    if hit("origin_missing"):
-        ext["origin_country"] = None
-        corrupted.add("origin_country")
+    corrupted_header: set[str] = set()
+    if hit("total_ocr"):
+        header["declared_value"] = float(_confuse_digit(f"{doc.invoice_total:.2f}", rng))
+        corrupted_header.add("declared_value")
     if hit("currency_wrong"):
-        ext["currency"] = CURRENCY_CONFUSION[doc.currency]
-        corrupted.add("currency")
+        header["currency"] = CURRENCY_CONFUSION[doc.currency]
+        corrupted_header.add("currency")
     if hit("eori_digit"):
-        ext["importer_eori"] = doc.importer_eori[:2] + _confuse_digit(doc.importer_eori[2:], rng)
-        corrupted.add("importer_eori")
-    if hit("bl_ocr"):
-        ext["bl_reference"] = _confuse_bl_chars(doc.bl_reference, rng)
-        corrupted.add("bl_reference")
-    if hit("incoterm_confusion"):
-        ext["incoterm"] = INCOTERM_CONFUSION[doc.incoterm]
-        corrupted.add("incoterm")
-    if hit("quantity_slip"):
-        ext["quantity"] = rng.choice(
-            [doc.quantity * 10, max(1, doc.quantity // 10), doc.quantity + 1]
+        header["importer_eori"] = doc.importer_eori[:2] + _confuse_digit(
+            doc.importer_eori[2:], rng
         )
-        corrupted.add("quantity")
-    if hit("package_off_by_one"):
-        ext["package_count"] = max(1, doc.package_count + rng.choice([-1, 1]))
-        corrupted.add("package_count")
-    if hit("net_exceeds_gross"):
-        ext["net_weight"] = round(doc.gross_weight * rng.uniform(1.02, 1.15), 1)
-        corrupted.add("net_weight")
+        corrupted_header.add("importer_eori")
+    if hit("bl_ocr"):
+        header["bl_reference"] = _confuse_bl_chars(doc.bl_reference, rng)
+        corrupted_header.add("bl_reference")
+    if hit("incoterm_confusion"):
+        header["incoterm"] = INCOTERM_CONFUSION[doc.incoterm]
+        corrupted_header.add("incoterm")
 
-    # Invoice date: possibly swap day and month, then render in the source's
-    # own format.
     extracted_date = doc.invoice_date
     d = doc.invoice_date
     if d.day <= 12 and d.day != d.month and hit("date_swap"):
         extracted_date = date(d.year, d.day, d.month)
-        corrupted.add("invoice_date")
-    ext["invoice_date"] = _format_extracted_date(extracted_date, doc.source_system, rng)
+        corrupted_header.add("invoice_date")
+    header["invoice_date"] = _format_extracted_date(extracted_date, doc.source_system, rng)
 
-    # Invoice lines (only serialised for Globex XML).
-    line_amounts = list(doc.line_amounts)
-    if doc.source_system == GLOBEX and hit("line_sum_error"):
-        i = rng.randrange(len(line_amounts))
-        line_amounts[i] = float(_confuse_digit(f"{line_amounts[i]:.2f}", rng))
+    header_confidence = {
+        field: _confidence_score(field in corrupted_header, rng)
+        for field in HEADER_CONFIDENCE_FIELDS
+    }
+    return header, header_confidence, items
 
-    confidence: dict[str, float] = {}
-    for field in CONFIDENCE_FIELDS:
-        if ext.get(field) is None:
-            continue  # nothing extracted, no score reported
-        if field in corrupted:
-            score = rng.uniform(0.45, 0.93)
-        elif rng.random() < 0.05:
-            score = rng.uniform(0.55, 0.82)  # correct but unsure
-        else:
-            score = rng.uniform(0.82, 0.995)
-        confidence[field] = round(score, 3)
 
-    return ext, confidence, line_amounts
+def _confidence_score(was_corrupted: bool, rng: random.Random) -> float:
+    if was_corrupted:
+        return round(rng.uniform(0.45, 0.93), 3)
+    if rng.random() < 0.05:
+        return round(rng.uniform(0.55, 0.82), 3)  # correct but unsure
+    return round(rng.uniform(0.82, 0.995), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -320,99 +484,133 @@ def _corrupt_for_extraction(
 
 def _file_with_possible_amendment(
     doc: TrueDoc, rng: random.Random
-) -> tuple[dict, list[dict]]:
-    """Return (filed row, amendment truth rows).  Filed values start as the
-    truth; a small share of documents is then legitimately amended after
-    filing, so the filed value differs from what any perfect extraction of
-    the original document would say."""
-    filed = {
-        "shipment_id": doc.shipment_id,
-        "doc_id": doc.doc_id,
-        "country": doc.country,
-        "hs_code": doc.hs_code,
-        "declared_value": f"{doc.declared_value:.2f}",
-        "currency": doc.currency,
-        "origin_country": doc.origin_country,
-        "quantity": doc.quantity,
-        "gross_weight": doc.gross_weight,
-        "net_weight": doc.net_weight,
-        "package_count": doc.package_count,
-        "incoterm": doc.incoterm,
-        "importer_eori": doc.importer_eori,
-        "bl_reference": doc.bl_reference,
-        "invoice_date": doc.invoice_date.isoformat(),
-        "filed_at": doc.filed_at.isoformat(sep=" ", timespec="seconds"),
-    }
+) -> tuple[list[TrueItem], float, list[dict]]:
+    """Return (filed items, filed invoice total, amendment truth rows).
+
+    Filed values start as the truth; a small share of documents is then
+    legitimately amended after filing.  The ledger stays internally
+    consistent: amend an item value and the filed invoice total is
+    recomputed, exactly as a filing system would."""
+    filed_items = [replace(item) for item in doc.items]
     amendments: list[dict] = []
-    if rng.random() < AMENDMENT_RATE:
-        field = rng.choice(["declared_value", "quantity", "hs_code"])
-        if field == "declared_value":
-            new = round(doc.declared_value * rng.choice([0.90, 0.95, 1.05, 1.10]), 2)
-            filed["declared_value"] = f"{new:.2f}"
-            note = "value revised after filing (e.g. credit note / recalculated freight)"
-        elif field == "quantity":
-            new = max(1, doc.quantity + rng.choice([-2, -1, 1, 2]))
-            filed["quantity"] = new
-            note = "quantity corrected after physical inspection"
-        else:
-            new = rng.choice([c for c in HS_POOL if c != doc.hs_code])
-            filed["hs_code"] = new
-            note = "reclassified by customs broker after filing"
+
+    def note_amendment(item: TrueItem, field: str, old, new, note: str) -> None:
         amendments.append(
             {
                 "doc_id": doc.doc_id,
+                "item_number": item.item_number,
                 "field": field,
-                "value_on_document": getattr(doc, field),
+                "value_on_document": old,
                 "filed_value": new,
                 "note": note,
             }
         )
-    return filed, amendments
+
+    if rng.random() < AMENDMENT_RATE:
+        kind = rng.choice(["item_value", "hs_reclass", "quantity"])
+        item = rng.choice(filed_items)
+        if kind == "quantity" and item.quantity_unit == "KGM":
+            kind = "item_value"  # KGM quantity is net mass; keep amendments simple
+        # Broker reclassifications stay within the chapter (a different CN
+        # split of the same kind of goods), so the supplementary unit is
+        # untouched.  No sibling code in the pool -> amend the value instead.
+        same_chapter = [
+            c for c in _POOL_BY_CHAPTER.get(item.hs_code[:2], []) if c != item.hs_code
+        ]
+        if kind == "hs_reclass" and not same_chapter:
+            kind = "item_value"
+        if kind == "item_value":
+            new_value = round(item.item_value * rng.choice([0.90, 0.95, 1.05, 1.10]), 2)
+            note_amendment(
+                item, "item_value", item.item_value, new_value,
+                "value revised after filing (credit note / recalculated freight)",
+            )
+            item.item_value = new_value
+        elif kind == "hs_reclass":
+            new_code = rng.choice(same_chapter)
+            note_amendment(
+                item, "hs_code", item.hs_code, new_code,
+                "reclassified by customs broker after filing",
+            )
+            item.hs_code = new_code
+        else:
+            new_quantity = float(max(1, int(item.quantity) + rng.choice([-2, -1, 1, 2])))
+            note_amendment(
+                item, "quantity", item.quantity, new_quantity,
+                "quantity corrected after physical inspection",
+            )
+            item.quantity = new_quantity
+
+    filed_total = round(sum(item.item_value for item in filed_items), 2)
+    if filed_total != doc.invoice_total:
+        amendments.append(
+            {
+                "doc_id": doc.doc_id,
+                "item_number": None,
+                "field": "declared_value",
+                "value_on_document": doc.invoice_total,
+                "filed_value": filed_total,
+                "note": "invoice total recomputed from the amended item",
+            }
+        )
+    return filed_items, filed_total, amendments
 
 
 # ---------------------------------------------------------------------------
 # writers for the fake source formats
 # ---------------------------------------------------------------------------
 
+_ACME_HEADER_CONF = [f"hconf_{field}" for field in HEADER_CONFIDENCE_FIELDS]
+_ACME_ITEM_CONF = [f"conf_{field}" for field in ITEM_CONFIDENCE_FIELDS]
 
-def _write_acme_csv(entries: list[tuple[TrueDoc, dict, dict]], path: Path) -> None:
+
+def _write_acme_csv(entries: list[tuple[TrueDoc, dict, dict, list[ExtractedItem]]], path: Path) -> None:
     columns = [
-        "shp_ref", "document_no", "decl_country", "tariff_code", "inv_value",
-        "ccy", "coo", "qty", "grs_kg", "net_kg", "pkgs", "terms", "eori_no",
-        "bl_no", "inv_date", "extracted_at",
-    ] + [f"conf_{field}" for field in CONFIDENCE_FIELDS]
+        "shp_ref", "document_no", "decl_country", "line_no", "tariff_code",
+        "coo", "qty", "qty_unit", "item_val", "grs_kg", "net_kg", "pkgs",
+        "inv_total", "ccy", "terms", "eori_no", "bl_no", "inv_date",
+        "extracted_at",
+    ] + _ACME_HEADER_CONF + _ACME_ITEM_CONF
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns)
         writer.writeheader()
-        for doc, ext, confidence in entries:
-            row = {
+        for doc, header, header_conf, items in entries:
+            base = {
                 "shp_ref": doc.shipment_id,
                 "document_no": doc.doc_id,
                 "decl_country": doc.country,
-                "tariff_code": ext["hs_code"],
-                "inv_value": f"{ext['declared_value']:.2f}",
-                "ccy": ext["currency"],
-                "coo": ext["origin_country"] or "",
-                "qty": ext["quantity"],
-                "grs_kg": ext["gross_weight"],
-                "net_kg": ext["net_weight"],
-                "pkgs": ext["package_count"],
-                "terms": ext["incoterm"],
-                "eori_no": ext["importer_eori"],
-                "bl_no": ext["bl_reference"],
-                "inv_date": ext["invoice_date"],
+                "inv_total": f"{header['declared_value']:.2f}",
+                "ccy": header["currency"],
+                "terms": header["incoterm"],
+                "eori_no": header["importer_eori"],
+                "bl_no": header["bl_reference"],
+                "inv_date": header["invoice_date"],
                 "extracted_at": doc.extracted_at.isoformat(sep=" ", timespec="seconds"),
             }
-            for field in CONFIDENCE_FIELDS:
-                row[f"conf_{field}"] = confidence.get(field, "")
-            writer.writerow(row)
+            for field in HEADER_CONFIDENCE_FIELDS:
+                base[f"hconf_{field}"] = header_conf.get(field, "")
+            for item in items:
+                row = base | {
+                    "line_no": item.item_number,
+                    "tariff_code": item.hs_code,
+                    "coo": item.origin_country or "",
+                    "qty": item.quantity,
+                    "qty_unit": item.quantity_unit,
+                    "item_val": f"{item.item_value:.2f}",
+                    "grs_kg": item.gross_weight,
+                    "net_kg": item.net_weight,
+                    "pkgs": item.package_count,
+                }
+                for field in ITEM_CONFIDENCE_FIELDS:
+                    row[f"conf_{field}"] = item.confidence.get(field, "")
+                writer.writerow(row)
 
 
 def _write_globex_xml(
-    entries: list[tuple[TrueDoc, dict, dict, list[float]]], path: Path
+    entries: list[tuple[TrueDoc, dict, dict, list[ExtractedItem]]], path: Path
 ) -> None:
     root = ET.Element("Extractions", system="GlobexCapture")
-    for doc, ext, confidence, line_amounts in entries:
+    for doc, header, header_conf, items in entries:
         document = ET.SubElement(
             root, "Document", id=doc.doc_id, extractedAt=doc.extracted_at.isoformat()
         )
@@ -420,45 +618,76 @@ def _write_globex_xml(
             document, "Shipment", ref=doc.shipment_id, declarationCountry=doc.country
         )
         goods = ET.SubElement(document, "Goods")
-        item_attrs = {"tariffCode": ext["hs_code"]}
-        if ext["origin_country"] is not None:
-            item_attrs["originCountry"] = ext["origin_country"]
-        item = ET.SubElement(goods, "Item", **item_attrs)
-        ET.SubElement(item, "Quantity").text = str(ext["quantity"])
+        for item in items:
+            item_attrs = {"number": str(item.item_number), "tariffCode": item.hs_code or ""}
+            if item.origin_country is not None:
+                item_attrs["originCountry"] = item.origin_country
+            item_el = ET.SubElement(goods, "Item", **item_attrs)
+            quantity_el = ET.SubElement(item_el, "Quantity", unit=item.quantity_unit)
+            quantity_el.text = str(item.quantity)
+            ET.SubElement(item_el, "Value").text = f"{item.item_value:.2f}"
+            ET.SubElement(
+                item_el, "Weights",
+                gross=str(item.gross_weight), net=str(item.net_weight),
+            )
+            ET.SubElement(item_el, "Packages").text = str(item.package_count)
+            conf_el = ET.SubElement(item_el, "Confidence")
+            for field, score in item.confidence.items():
+                ET.SubElement(conf_el, "Field", name=field, score=str(score))
+        commercial = ET.SubElement(document, "Commercial", incoterm=header["incoterm"])
         ET.SubElement(
-            item, "Weights",
-            gross=str(ext["gross_weight"]), net=str(ext["net_weight"]),
-        )
-        ET.SubElement(item, "Packages").text = str(ext["package_count"])
-        commercial = ET.SubElement(document, "Commercial", incoterm=ext["incoterm"])
-        invoice = ET.SubElement(
             commercial, "Invoice",
-            date=ext["invoice_date"], currency=ext["currency"],
-            total=f"{ext['declared_value']:.2f}",
+            date=header["invoice_date"], currency=header["currency"],
+            total=f"{header['declared_value']:.2f}",
         )
-        for amount in line_amounts:
-            ET.SubElement(invoice, "Line", amount=f"{amount:.2f}")
-        ET.SubElement(commercial, "Transport", blReference=ext["bl_reference"])
-        ET.SubElement(commercial, "Importer", eori=ext["importer_eori"])
+        ET.SubElement(commercial, "Transport", blReference=header["bl_reference"])
+        ET.SubElement(commercial, "Importer", eori=header["importer_eori"])
         conf_el = ET.SubElement(document, "Confidence")
-        for field, score in confidence.items():
+        for field, score in header_conf.items():
             ET.SubElement(conf_el, "Field", name=field, score=str(score))
     tree = ET.ElementTree(root)
     ET.indent(tree)
     tree.write(path, encoding="utf-8", xml_declaration=True)
 
 
-def _write_filed_csv(rows: list[dict], path: Path) -> None:
+def _write_filed_csv(
+    entries: list[tuple[TrueDoc, list[TrueItem], float]], path: Path
+) -> None:
     columns = [
-        "shipment_id", "doc_id", "country", "hs_code", "declared_value",
-        "currency", "origin_country", "quantity", "gross_weight", "net_weight",
-        "package_count", "incoterm", "importer_eori", "bl_reference",
+        "shipment_id", "doc_id", "country", "item_number", "hs_code",
+        "origin_country", "quantity", "quantity_unit", "item_value",
+        "gross_weight", "net_weight", "package_count", "declared_value",
+        "currency", "incoterm", "importer_eori", "bl_reference",
         "invoice_date", "filed_at",
     ]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns)
         writer.writeheader()
-        writer.writerows(rows)
+        for doc, filed_items, filed_total in entries:
+            for item in filed_items:
+                writer.writerow(
+                    {
+                        "shipment_id": doc.shipment_id,
+                        "doc_id": doc.doc_id,
+                        "country": doc.country,
+                        "item_number": item.item_number,
+                        "hs_code": item.hs_code,
+                        "origin_country": item.origin_country,
+                        "quantity": item.quantity,
+                        "quantity_unit": item.quantity_unit,
+                        "item_value": f"{item.item_value:.2f}",
+                        "gross_weight": item.gross_weight,
+                        "net_weight": item.net_weight,
+                        "package_count": item.package_count,
+                        "declared_value": f"{filed_total:.2f}",
+                        "currency": doc.currency,
+                        "incoterm": doc.incoterm,
+                        "importer_eori": doc.importer_eori,
+                        "bl_reference": doc.bl_reference,
+                        "invoice_date": doc.invoice_date.isoformat(),
+                        "filed_at": doc.filed_at.isoformat(sep=" ", timespec="seconds"),
+                    }
+                )
 
 
 def _write_tariff_csv(path: Path) -> None:
@@ -475,7 +704,7 @@ def _write_tariff_csv(path: Path) -> None:
 
 
 def _write_amendments_csv(rows: list[dict], path: Path) -> None:
-    columns = ["doc_id", "field", "value_on_document", "filed_value", "note"]
+    columns = ["doc_id", "item_number", "field", "value_on_document", "filed_value", "note"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns)
         writer.writeheader()
@@ -493,21 +722,24 @@ def generate(n_docs: int = 3000, seed: int = 42, data_dir: str | Path = "data") 
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    acme_entries: list[tuple[TrueDoc, dict, dict]] = []
-    globex_entries: list[tuple[TrueDoc, dict, dict, list[float]]] = []
-    filed_rows: list[dict] = []
+    acme_entries = []
+    globex_entries = []
+    filed_entries = []
     amendment_rows: list[dict] = []
+    n_items_total = 0
 
     for i in range(n_docs):
         doc = _make_true_doc(i, rng)
-        ext, confidence, line_amounts = _corrupt_for_extraction(doc, rng)
-        filed, amendments = _file_with_possible_amendment(doc, rng)
-        filed_rows.append(filed)
+        n_items_total += len(doc.items)
+        header, header_conf, items = _corrupt_for_extraction(doc, rng)
+        filed_items, filed_total, amendments = _file_with_possible_amendment(doc, rng)
+        filed_entries.append((doc, filed_items, filed_total))
         amendment_rows.extend(amendments)
+        entry = (doc, header, header_conf, items)
         if doc.source_system == ACME:
-            acme_entries.append((doc, ext, confidence))
+            acme_entries.append(entry)
         else:
-            globex_entries.append((doc, ext, confidence, line_amounts))
+            globex_entries.append(entry)
 
     paths = {
         "acme_csv": data_dir / "extracted_acme.csv",
@@ -518,12 +750,13 @@ def generate(n_docs: int = 3000, seed: int = 42, data_dir: str | Path = "data") 
     }
     _write_acme_csv(acme_entries, paths["acme_csv"])
     _write_globex_xml(globex_entries, paths["globex_xml"])
-    _write_filed_csv(filed_rows, paths["filed_csv"])
+    _write_filed_csv(filed_entries, paths["filed_csv"])
     _write_tariff_csv(paths["tariff_csv"])
     _write_amendments_csv(amendment_rows, paths["amendments_csv"])
 
     return {
         "n_docs": n_docs,
+        "n_items": n_items_total,
         "seed": seed,
         "n_acme": len(acme_entries),
         "n_globex": len(globex_entries),
@@ -540,7 +773,7 @@ def main() -> None:
     args = parser.parse_args()
     summary = generate(n_docs=args.docs, seed=args.seed, data_dir=args.data_dir)
     print(
-        f"Generated {summary['n_docs']} documents "
+        f"Generated {summary['n_docs']} documents with {summary['n_items']} goods items "
         f"({summary['n_acme']} Acme CSV, {summary['n_globex']} Globex XML), "
         f"{summary['n_amended_docs']} legitimately amended after filing."
     )

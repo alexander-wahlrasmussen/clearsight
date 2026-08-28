@@ -1,13 +1,15 @@
-# Field criticality and comparison configuration.
+# Field criticality and comparison configuration (v2: multi-item).
 #
 # This file is the single source of truth for:
-#   - which canonical fields are compared at all,
+#   - which canonical fields are compared at all, header and item level,
 #   - how critical each field is (its tier),
-#   - which comparator judges it, and with which parameters.
+#   - which comparator judges it, and with which parameters,
+#   - how severe a structural defect (missed / spurious goods item) is,
+#   - the minimum similarity score at which items may be paired.
 #
 # Nothing about criticality is hardcoded in Python.  Moving a field between
-# tiers, loosening a tolerance, or switching a comparator is an edit here
-# and a re-run -- no code change.
+# tiers, loosening a tolerance, switching a comparator, or deciding that a
+# missed item is only tier 2 is an edit here and a re-run -- no code change.
 #
 # Tiers:
 #   1  an error blocks or corrupts the filing (wrong duty, wrong compliance
@@ -17,24 +19,49 @@
 #
 # critical_tier controls which tier defines a "clean" document.
 #
-# Identity fields (shipment_id, doc_id, country, source_system) are not
-# listed: doc_id is the join key and the others are provenance, not
-# extracted content.
+# Identity fields (shipment_id, doc_id, country, source_system, and item
+# numbers) are not listed: doc_id is the join key, item numbers are context
+# for alignment, and the rest is provenance, not extracted content.
 
-version: 1
+version: 2
 critical_tier: 1
 
-fields:
-  hs_code:
+# Header: one comparison per document.
+header_fields:
+  declared_value:          # invoice total
+    tier: 1
+    comparator: numeric_with_tolerance
+    params: {pct: 0.5}     # customs value tolerance; anything beyond is a duty error
+
+  currency:
     tier: 1
     comparator: exact_code
 
-  declared_value:
+  importer_eori:
     tier: 1
-    comparator: numeric_with_tolerance
-    params: {pct: 0.5}   # customs value tolerance; anything beyond is a duty error
+    comparator: exact_code
 
-  currency:
+  incoterm:
+    tier: 2
+    comparator: exact_code
+
+  invoice_date:
+    tier: 2
+    comparator: normalised_date
+    params: {dayfirst: true}   # DE/NL sources write day-first
+
+  # fuzzy_name is built for party/consignee names; we exercise it here on
+  # the bill-of-lading reference, the only free-ish text field the record
+  # carries.  OCR character confusion (O/0, I/1, B/8) makes it a
+  # reasonable fit.
+  bl_reference:
+    tier: 3
+    comparator: fuzzy_name
+    params: {threshold: 0.9}
+
+# Items: one comparison per ALIGNED pair of goods items.
+item_fields:
+  hs_code:
     tier: 1
     comparator: exact_code
 
@@ -42,44 +69,44 @@ fields:
     tier: 1
     comparator: iso_country
 
-  importer_eori:
+  item_value:
     tier: 1
-    comparator: exact_code
+    comparator: numeric_with_tolerance
+    params: {pct: 0.5}
 
   quantity:
     tier: 2
     comparator: numeric_with_tolerance
-    params: {pct: 0.0}   # counts must match exactly
+    params: {pct: 0.0}     # counts must match exactly
 
-  gross_weight:
+  quantity_unit:           # a quantity in the wrong unit is not a quantity
     tier: 2
-    comparator: numeric_with_tolerance
-    params: {pct: 1.0}   # scales and rounding differ between systems
+    comparator: exact_code
 
   net_weight:
     tier: 2
     comparator: numeric_with_tolerance
+    params: {pct: 1.0}     # scales and rounding differ between systems
+
+  gross_weight:
+    tier: 2
+    comparator: numeric_with_tolerance
     params: {pct: 1.0}
-
-  invoice_date:
-    tier: 2
-    comparator: normalised_date
-    params: {dayfirst: true}   # our sources are predominantly European
-
-  incoterm:
-    tier: 2
-    comparator: exact_code
 
   package_count:
     tier: 3
     comparator: numeric_with_tolerance
     params: {pct: 0.0}
 
-  # fuzzy_name is built for party/consignee names; we exercise it here on
-  # the bill-of-lading reference, the only free-ish text field the canonical
-  # record carries.  OCR character confusion (O/0, I/1, B/8) makes it a
-  # reasonable fit.
-  bl_reference:
-    tier: 3
-    comparator: fuzzy_name
-    params: {threshold: 0.9}
+# Structural defects found by item alignment.  A filed item nothing was
+# extracted for (missed_item) and an extracted item nothing was filed for
+# (spurious_item) are whole-line failures, so they default to tier 1.
+structure:
+  missed_item_tier: 1
+  spurious_item_tier: 1
+
+# Items pair only when their similarity score clears this floor; below it
+# they are reported unmatched instead of force-paired.  See alignment.py
+# for the scoring.
+alignment:
+  min_score: 0.35

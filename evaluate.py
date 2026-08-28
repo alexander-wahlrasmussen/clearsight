@@ -2,17 +2,27 @@
 
 The whole module is built around one idea: every aggregate number must be
 traceable to rows a human can inspect.  So the first thing evaluate()
-produces is the `comparisons` DataFrame -- one row per (document, field)
-with the extracted value, the filed value, the comparator's verdict and
-its reason -- and every metric after that is a plain aggregation of that
-frame.  If a number in the report looks wrong, filter field_comparisons.csv
-and read the rows.
+produces is the `comparisons` DataFrame -- one row per compared thing --
+and every metric after that is a plain aggregation of that frame.  If a
+number in the report looks wrong, filter field_comparisons.csv and read
+the rows.
+
+Rows come at three levels (the `level` column):
+  header     one row per (document, header field)
+  item       one row per (aligned item pair, item field); carries both
+             item numbers, the alignment score and the aligner's stated
+             basis for the pairing
+  structure  one row per unmatched goods item: field "missed_item" for a
+             filed item nothing was extracted for, "spurious_item" for an
+             extracted item nothing was filed for.  Their tier comes from
+             field_tiers.yaml, so a missed line makes a document not clean
+             exactly as configured, through the same frame as everything
+             else.
 
 What "filed" means here: the record the downstream system ended up with.
-That is NOT ground truth -- see the README for the two ways this is
-knowingly wrong (legitimate post-filing amendments, and filed values that
-are themselves incorrect).  This module measures agreement with the filed
-record, nothing more.
+That is NOT ground truth -- see the README for the ways this is knowingly
+wrong (legitimate post-filing amendments, filed values that are themselves
+incorrect, and the alignment's own assumptions).
 """
 
 from __future__ import annotations
@@ -25,6 +35,7 @@ import pandas as pd
 import yaml
 
 import comparators
+from alignment import ALIGNER_NAME, ALIGNER_VERSION, align_items, describe_item
 from canonical import CanonicalRecord
 from comparators import MATCH, MISMATCH, Comparator
 
@@ -32,6 +43,8 @@ from comparators import MATCH, MISMATCH, Comparator
 DEFAULT_THRESHOLDS = [0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.95, 0.99]
 
 CALIBRATION_BUCKETS = [f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10)]
+
+HEADER, ITEM, STRUCTURE = "header", "item", "structure"
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +63,11 @@ class FieldSpec:
 class TiersConfig:
     version: int
     critical_tier: int  # the tier whose mismatches make a document "not clean"
-    fields: dict[str, FieldSpec]
+    header_fields: dict[str, FieldSpec]
+    item_fields: dict[str, FieldSpec]
+    missed_item_tier: int
+    spurious_item_tier: int
+    alignment_min_score: float
 
 
 def load_field_tiers(path: str | Path) -> TiersConfig:
@@ -60,17 +77,26 @@ def load_field_tiers(path: str | Path) -> TiersConfig:
     it into objects."""
     with open(path, encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
-    fields = {}
-    for name, spec in raw["fields"].items():
-        fields[name] = FieldSpec(
-            name=name,
-            tier=int(spec["tier"]),
-            comparator=comparators.from_config(spec["comparator"], spec.get("params")),
-        )
+
+    def build(section: dict) -> dict[str, FieldSpec]:
+        return {
+            name: FieldSpec(
+                name=name,
+                tier=int(spec["tier"]),
+                comparator=comparators.from_config(spec["comparator"], spec.get("params")),
+            )
+            for name, spec in section.items()
+        }
+
+    structure = raw.get("structure", {})
     return TiersConfig(
-        version=int(raw.get("version", 1)),
+        version=int(raw.get("version", 2)),
         critical_tier=int(raw.get("critical_tier", 1)),
-        fields=fields,
+        header_fields=build(raw["header_fields"]),
+        item_fields=build(raw["item_fields"]),
+        missed_item_tier=int(structure.get("missed_item_tier", 1)),
+        spurious_item_tier=int(structure.get("spurious_item_tier", 1)),
+        alignment_min_score=float(raw.get("alignment", {}).get("min_score", 0.35)),
     )
 
 
@@ -92,12 +118,13 @@ class Evaluation:
     n_joined: int
     unmatched_extracted: list[str]  # doc_ids extracted but never filed
     unmatched_filed: list[str]      # doc_ids filed but never extracted
-    comparisons: pd.DataFrame       # one row per (document, field)
+    comparisons: pd.DataFrame       # one row per compared thing (see module docstring)
     doc_summary: pd.DataFrame       # one row per document
     per_field: pd.DataFrame         # precision / recall per field
     breakdown: pd.DataFrame         # mismatches by country x source system
     calibration: pd.DataFrame       # observed accuracy per confidence decile
     straight_through: pd.DataFrame  # auto-accept share / escaped errors per threshold
+    alignment_summary: pd.DataFrame # item pairing outcomes per source system
 
 
 def evaluate(
@@ -106,10 +133,10 @@ def evaluate(
     tiers: TiersConfig,
     thresholds: list[float] = DEFAULT_THRESHOLDS,
 ) -> Evaluation:
-    comparisons, unmatched_extracted, unmatched_filed = _compare_all(
+    comparisons, doc_stats, unmatched_extracted, unmatched_filed = _compare_all(
         extracted, filed, tiers
     )
-    doc_summary = _summarise_documents(comparisons, tiers.critical_tier)
+    doc_summary = _summarise_documents(comparisons, doc_stats, tiers.critical_tier)
     clean_rate = float(doc_summary["clean"].mean()) if len(doc_summary) else math.nan
     return Evaluation(
         clean_document_rate=clean_rate,
@@ -125,6 +152,7 @@ def evaluate(
         breakdown=_mismatch_breakdown(comparisons, doc_summary, tiers.critical_tier),
         calibration=_calibration_table(comparisons),
         straight_through=_straight_through(doc_summary, thresholds),
+        alignment_summary=_alignment_summary(doc_summary),
     )
 
 
@@ -137,48 +165,161 @@ def _compare_all(
     extracted: list[CanonicalRecord],
     filed: list[CanonicalRecord],
     tiers: TiersConfig,
-) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """Join on doc_id and apply the configured comparator to every field."""
+) -> tuple[pd.DataFrame, dict[str, dict], list[str], list[str]]:
+    """Join on doc_id, align goods items, and apply the configured
+    comparator to every header and item field."""
     filed_by_id = {r.doc_id: r for r in filed}
     extracted_ids = {r.doc_id for r in extracted}
     unmatched_extracted = sorted(extracted_ids - filed_by_id.keys())
     unmatched_filed = sorted(filed_by_id.keys() - extracted_ids)
 
-    rows = []
+    rows: list[dict] = []
+    doc_stats: dict[str, dict] = {}
     for record in extracted:
         filed_record = filed_by_id.get(record.doc_id)
         if filed_record is None:
             continue  # counted in unmatched_extracted, nothing to compare
-        for spec in tiers.fields.values():
+        country = filed_record.country or record.country
+
+        def base_row(level: str, field: str, tier: int) -> dict:
+            return {
+                "doc_id": record.doc_id,
+                "level": level,
+                "field": field,
+                "tier": tier,
+                # country of filing comes from the filed record (the
+                # authoritative side); source_system from the extracted
+                # one (that is what we are measuring).
+                "country": country,
+                "source_system": record.source_system,
+                "item_no_extracted": None,
+                "item_no_filed": None,
+                "alignment_score": None,
+                "alignment_basis": None,
+            }
+
+        # header fields ---------------------------------------------------
+        for spec in tiers.header_fields.values():
             extracted_value = getattr(record, spec.name)
             filed_value = getattr(filed_record, spec.name)
             result = spec.comparator.compare(extracted_value, filed_value)
-            confidence = record.extraction_confidence.get(spec.name)
             rows.append(
-                {
-                    "doc_id": record.doc_id,
-                    "field": spec.name,
-                    "tier": spec.tier,
+                base_row(HEADER, spec.name, spec.tier)
+                | {
                     "extracted_value": extracted_value,
                     "filed_value": filed_value,
                     "extracted_present": not comparators.is_missing(extracted_value),
                     "filed_present": not comparators.is_missing(filed_value),
                     "status": result.status,
                     "reason": result.reason,
-                    "confidence": confidence,
-                    # country of filing comes from the filed record (the
-                    # authoritative side); source_system from the extracted
-                    # one (that is what we are measuring).
-                    "country": filed_record.country or record.country,
-                    "source_system": record.source_system,
+                    "confidence": record.extraction_confidence.get(spec.name),
                     "comparator": spec.comparator.name,
                     "comparator_version": spec.comparator.VERSION,
                 }
             )
+
+        # goods items: align first, then compare within each pair ---------
+        aligned = align_items(record.items, filed_record.items, tiers.alignment_min_score)
+        for pair in aligned.pairs:
+            for spec in tiers.item_fields.values():
+                extracted_value = getattr(pair.extracted, spec.name)
+                filed_value = getattr(pair.filed, spec.name)
+                result = spec.comparator.compare(extracted_value, filed_value)
+                rows.append(
+                    base_row(ITEM, spec.name, spec.tier)
+                    | {
+                        "item_no_extracted": pair.extracted.item_number,
+                        "item_no_filed": pair.filed.item_number,
+                        "alignment_score": pair.score,
+                        "alignment_basis": pair.basis,
+                        "extracted_value": extracted_value,
+                        "filed_value": filed_value,
+                        "extracted_present": not comparators.is_missing(extracted_value),
+                        "filed_present": not comparators.is_missing(filed_value),
+                        "status": result.status,
+                        "reason": result.reason,
+                        "confidence": pair.extracted.extraction_confidence.get(spec.name),
+                        "comparator": spec.comparator.name,
+                        "comparator_version": spec.comparator.VERSION,
+                    }
+                )
+        for item in aligned.unmatched_filed:
+            rows.append(
+                base_row(STRUCTURE, "missed_item", tiers.missed_item_tier)
+                | {
+                    "item_no_filed": item.item_number,
+                    "extracted_value": None,
+                    "filed_value": describe_item(item),
+                    "extracted_present": False,
+                    "filed_present": True,
+                    "status": MISMATCH,
+                    "reason": (
+                        f"filed {describe_item(item)} has no extracted counterpart "
+                        f"scoring >= {tiers.alignment_min_score} -- a dropped or merged line?"
+                    ),
+                    "confidence": None,
+                    "comparator": ALIGNER_NAME,
+                    "comparator_version": ALIGNER_VERSION,
+                }
+            )
+        for item in aligned.unmatched_extracted:
+            rows.append(
+                base_row(STRUCTURE, "spurious_item", tiers.spurious_item_tier)
+                | {
+                    "item_no_extracted": item.item_number,
+                    "extracted_value": describe_item(item),
+                    "filed_value": None,
+                    "extracted_present": True,
+                    "filed_present": False,
+                    "status": MISMATCH,
+                    "reason": (
+                        f"extracted {describe_item(item)} has no filed counterpart "
+                        f"scoring >= {tiers.alignment_min_score} -- an invented line "
+                        "(a subtotal or footer read as goods)?"
+                    ),
+                    "confidence": None,
+                    "comparator": ALIGNER_NAME,
+                    "comparator_version": ALIGNER_VERSION,
+                }
+            )
+
+        doc_stats[record.doc_id] = {
+            "extracted_items": len(record.items),
+            "filed_items": len(filed_record.items),
+            "paired_items": len(aligned.pairs),
+            "missed_items": len(aligned.unmatched_filed),
+            "spurious_items": len(aligned.unmatched_extracted),
+            "min_critical_confidence": _min_critical_confidence(record, tiers),
+        }
+
     comparisons = pd.DataFrame(rows)
     comparisons["confidence"] = pd.to_numeric(comparisons["confidence"], errors="coerce")
     comparisons["confidence_bucket"] = comparisons["confidence"].map(_bucket_label)
-    return comparisons, unmatched_extracted, unmatched_filed
+    return comparisons, doc_stats, unmatched_extracted, unmatched_filed
+
+
+def _min_critical_confidence(record: CanonicalRecord, tiers: TiersConfig) -> float:
+    """The number an auto-accept gate would act on, computed EX ANTE from
+    the extracted record alone: the minimum confidence over every
+    critical-tier header field and every critical-tier field of every
+    extracted item.  NaN when any of those scores is missing -- such a
+    document can never auto-accept.
+
+    Deliberately blind to alignment: a document whose extraction dropped a
+    goods item can look perfectly confident here.  That is the point --
+    the straight-through table must show what a confidence gate would
+    really let through."""
+    scores: list[float] = []
+    for spec in tiers.header_fields.values():
+        if spec.tier == tiers.critical_tier:
+            scores.append(record.extraction_confidence.get(spec.name))
+    for item in record.items:
+        for spec in tiers.item_fields.values():
+            if spec.tier == tiers.critical_tier:
+                scores.append(item.extraction_confidence.get(spec.name))
+    if not scores or any(score is None for score in scores):
+        return math.nan
+    return min(scores)
 
 
 def _bucket_label(confidence: float) -> str | None:
@@ -193,9 +334,12 @@ def _bucket_label(confidence: float) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _summarise_documents(comparisons: pd.DataFrame, critical_tier: int) -> pd.DataFrame:
-    """One row per document: mismatch counts per tier, the minimum confidence
-    across critical-tier fields, and the clean flag that feeds the headline."""
+def _summarise_documents(
+    comparisons: pd.DataFrame, doc_stats: dict[str, dict], critical_tier: int
+) -> pd.DataFrame:
+    """One row per document: mismatch counts per tier, item alignment
+    outcomes, the ex-ante minimum critical confidence, and the clean flag
+    that feeds the headline."""
     summary = comparisons.groupby("doc_id").agg(
         country=("country", "first"),
         source_system=("source_system", "first"),
@@ -206,20 +350,18 @@ def _summarise_documents(comparisons: pd.DataFrame, critical_tier: int) -> pd.Da
         counts = tier_rows.groupby("doc_id")["status"].agg(lambda s: int((s == MISMATCH).sum()))
         summary[f"tier{tier}_mismatches"] = counts.reindex(summary.index).fillna(0).astype(int)
 
-    critical_rows = comparisons[comparisons["tier"] == critical_tier]
-    # min with skipna=False: if ANY critical field lacks a confidence score,
-    # the document has no usable minimum and can never auto-accept.
-    min_confidence = critical_rows.groupby("doc_id")["confidence"].agg(
-        lambda s: s.min(skipna=False)
-    )
-    summary["min_critical_confidence"] = min_confidence.reindex(summary.index)
+    stats = pd.DataFrame.from_dict(doc_stats, orient="index")
+    summary = summary.join(stats)
     summary["critical_mismatches"] = summary[f"tier{critical_tier}_mismatches"]
     summary["clean"] = summary["critical_mismatches"] == 0
-    return summary.reset_index()
+    return summary.reset_index().rename(columns={"index": "doc_id"})
 
 
 def _per_field_metrics(comparisons: pd.DataFrame, tiers: TiersConfig) -> pd.DataFrame:
-    """Per-field precision and recall.
+    """Per-field precision and recall, header and item fields alike (item
+    fields aggregate over all aligned pairs).  Structure rows are excluded:
+    a missed item has no precision/recall semantics -- it is counted in the
+    alignment summary and in every mismatch rollup instead.
 
     Definitions (deliberately simple; see README):
       precision  of the rows where the tool extracted a value AND the filed
@@ -229,18 +371,21 @@ def _per_field_metrics(comparisons: pd.DataFrame, tiers: TiersConfig) -> pd.Data
                  where the tool extracted a matching one.  A value the tool
                  failed to extract hurts recall, not precision.
     """
+    specs = {**tiers.header_fields, **tiers.item_fields}
+    field_rows = comparisons[comparisons["level"] != STRUCTURE]
     rows = []
-    for (field, tier), group in comparisons.groupby(["field", "tier"], sort=False):
+    for (level, field, tier), group in field_rows.groupby(["level", "field", "tier"], sort=False):
         both_present = int((group["extracted_present"] & group["filed_present"]).sum())
         filed_present = int(group["filed_present"].sum())
         matches = int((group["status"] == MATCH).sum())
         mismatches = int((group["status"] == MISMATCH).sum())
         rows.append(
             {
+                "level": level,
                 "field": field,
                 "tier": tier,
-                "comparator": tiers.fields[field].comparator.describe(),
-                "n_documents": len(group),
+                "comparator": specs[field].comparator.describe(),
+                "n_comparisons": len(group),
                 "matches": matches,
                 "mismatches": mismatches,
                 "missing_extracted": int(
@@ -251,7 +396,7 @@ def _per_field_metrics(comparisons: pd.DataFrame, tiers: TiersConfig) -> pd.Data
                 "recall": matches / filed_present if filed_present else math.nan,
             }
         )
-    return pd.DataFrame(rows).sort_values(["tier", "field"]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["tier", "level", "field"]).reset_index(drop=True)
 
 
 def _mismatch_breakdown(
@@ -289,8 +434,9 @@ def _calibration_table(comparisons: pd.DataFrame) -> pd.DataFrame:
 
     Only rows with a confidence score AND a definite verdict (match or
     mismatch) participate; not-comparable rows tell us nothing about
-    calibration.  If the tool's confidence means anything, accuracy should
-    climb with the bucket."""
+    calibration, and structure rows carry no confidence at all.  If the
+    tool's confidence means anything, accuracy should climb with the
+    bucket."""
     scored = comparisons[
         comparisons["confidence"].notna()
         & comparisons["status"].isin([MATCH, MISMATCH])
@@ -318,10 +464,12 @@ def _straight_through(doc_summary: pd.DataFrame, thresholds: list[float]) -> pd.
     workload goes straight through, and what critical error rate escapes
     with it?
 
-    Honesty note: "escaped errors" are documents that disagree with what was
-    eventually filed.  Some of those are legitimate post-filing amendments,
-    not extraction errors, so this is an upper bound on the true escape rate.
-    """
+    Two honesty notes.  "Escaped errors" are documents that disagree with
+    what was eventually filed, so legitimate post-filing amendments count
+    as escapes -- treat the rate as an upper bound.  And the gate sees only
+    per-field confidence: a document whose extraction silently DROPPED a
+    goods item still auto-accepts (the missing line has no score to be low),
+    which is exactly how a real confidence gate fails."""
     n_docs = len(doc_summary)
     confidence = doc_summary["min_critical_confidence"]
     rows = []
@@ -341,6 +489,28 @@ def _straight_through(doc_summary: pd.DataFrame, thresholds: list[float]) -> pd.
     return pd.DataFrame(rows)
 
 
+def _alignment_summary(doc_summary: pd.DataFrame) -> pd.DataFrame:
+    """Item pairing outcomes per source system: how many goods items each
+    side had, how many paired, how many were missed or spurious."""
+    rows = []
+    for system, group in doc_summary.groupby("source_system"):
+        rows.append(
+            {
+                "source_system": system,
+                "documents": len(group),
+                "extracted_items": int(group["extracted_items"].sum()),
+                "filed_items": int(group["filed_items"].sum()),
+                "paired_items": int(group["paired_items"].sum()),
+                "missed_items": int(group["missed_items"].sum()),
+                "spurious_items": int(group["spurious_items"].sum()),
+                "docs_with_structure_defects": int(
+                    ((group["missed_items"] > 0) | (group["spurious_items"] > 0)).sum()
+                ),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("source_system").reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # persistence
 # ---------------------------------------------------------------------------
@@ -358,6 +528,7 @@ def write_outputs(evaluation: Evaluation, out_dir: str | Path) -> dict[str, str]
         "breakdown.csv": evaluation.breakdown,
         "calibration.csv": evaluation.calibration,
         "straight_through.csv": evaluation.straight_through,
+        "alignment_summary.csv": evaluation.alignment_summary,
     }
     paths = {}
     for filename, frame in frames.items():
