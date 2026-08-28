@@ -1,0 +1,85 @@
+# Field criticality and comparison configuration.
+#
+# This file is the single source of truth for:
+#   - which canonical fields are compared at all,
+#   - how critical each field is (its tier),
+#   - which comparator judges it, and with which parameters.
+#
+# Nothing about criticality is hardcoded in Python.  Moving a field between
+# tiers, loosening a tolerance, or switching a comparator is an edit here
+# and a re-run -- no code change.
+#
+# Tiers:
+#   1  an error blocks or corrupts the filing (wrong duty, wrong compliance
+#      outcome).  The headline clean_document_rate counts only these.
+#   2  an error causes rework or downstream friction but the filing stands.
+#   3  cosmetic / reference data; worth tracking, not worth alarming on.
+#
+# critical_tier controls which tier defines a "clean" document.
+#
+# Identity fields (shipment_id, doc_id, country, source_system) are not
+# listed: doc_id is the join key and the others are provenance, not
+# extracted content.
+
+version: 1
+critical_tier: 1
+
+fields:
+  hs_code:
+    tier: 1
+    comparator: exact_code
+
+  declared_value:
+    tier: 1
+    comparator: numeric_with_tolerance
+    params: {pct: 0.5}   # customs value tolerance; anything beyond is a duty error
+
+  currency:
+    tier: 1
+    comparator: exact_code
+
+  origin_country:
+    tier: 1
+    comparator: iso_country
+
+  importer_eori:
+    tier: 1
+    comparator: exact_code
+
+  quantity:
+    tier: 2
+    comparator: numeric_with_tolerance
+    params: {pct: 0.0}   # counts must match exactly
+
+  gross_weight:
+    tier: 2
+    comparator: numeric_with_tolerance
+    params: {pct: 1.0}   # scales and rounding differ between systems
+
+  net_weight:
+    tier: 2
+    comparator: numeric_with_tolerance
+    params: {pct: 1.0}
+
+  invoice_date:
+    tier: 2
+    comparator: normalised_date
+    params: {dayfirst: true}   # our sources are predominantly European
+
+  incoterm:
+    tier: 2
+    comparator: exact_code
+
+  package_count:
+    tier: 3
+    comparator: numeric_with_tolerance
+    params: {pct: 0.0}
+
+  # fuzzy_name is built for party/consignee names; we exercise it here on
+  # the bill-of-lading reference, the only free-ish text field the canonical
+  # record carries.  OCR character confusion (O/0, I/1, B/8) makes it a
+  # reasonable fit.
+  bl_reference:
+    tier: 3
+    comparator: fuzzy_name
+    params: {threshold: 0.9}
