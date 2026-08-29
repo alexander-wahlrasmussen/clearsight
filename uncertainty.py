@@ -1,20 +1,25 @@
-"""Error bars for the harness's metrics.  Stdlib only, on purpose.
+"""Error bars: how much could each percentage wobble by pure chance?
 
-Two tools, two lessons:
+A rate computed from 500 documents is not a fact, it is an estimate, and
+the honest way to present it is with the range of values it could
+plausibly stand for.  Standard library only, on purpose.  Two tools, two
+lessons:
 
-- The bootstrap: resample documents with replacement and recompute the
-  rate.  The general-purpose tool -- it works for any statistic, not just
-  proportions -- shown here in its plainest form so the mechanics are
-  visible.  Used for the headline clean document rate.
-- The Wilson score interval: the closed-form confidence interval for a
-  proportion.  Instant, well-behaved at small n and near 0%/100%, so it is
-  what we use for every per-slice rate and for the audit-sample estimate.
+- The bootstrap: re-draw the same number of documents at random (allowing
+  repeats) hundreds of times, recompute the rate each time, and read the
+  range off the spread.  Crude, general and honest -- it works for any
+  statistic, not just percentages -- shown here in its plainest form so
+  the mechanics are visible.  Used for the headline clean document rate.
+- The Wilson score interval: a ready-made formula for "how sure can you
+  be about a percentage based on n cases".  Instant, and it behaves well
+  for small slices and rates near 0% or 100%, so it is what we use for
+  every per-slice rate and for the audit-sample estimate.
 
-The audit-sample estimator is the production bridge for the gold regime:
-you never have ground truth for the whole population, you have a sampled
-human audit.  Draw K documents, grade only those against truth, and the
-Wilson interval tells you what the sample is worth.  The CI width is the
-price list for annotation: precision scales with sqrt(K).
+The audit-sample estimator is how the gold regime survives contact with
+production: nobody has the truth for the whole population, but you can
+have a person grade a random sample of K documents and let the interval
+say what that sample is worth.  The interval's width is the price list
+for human checking: to halve it, grade four times as many documents.
 """
 
 from __future__ import annotations
@@ -31,8 +36,9 @@ Z_95 = 1.96  # two-sided 95%
 def bootstrap_rate_ci(
     flags, n_boot: int = 500, seed: int = 1, alpha: float = 0.05
 ) -> tuple[float, float]:
-    """Percentile bootstrap CI for the mean of a boolean flag, resampling
-    documents with replacement.  Deterministic for a given seed."""
+    """The likely range for a yes/no rate: re-draw n documents at random
+    (allowing repeats) n_boot times, recompute the rate each time, and
+    take the middle 95% of the results.  Deterministic for a given seed."""
     values = [bool(v) for v in flags]
     n = len(values)
     if n == 0:
@@ -45,7 +51,8 @@ def bootstrap_rate_ci(
 
 
 def wilson_interval(successes: int, n: int, z: float = Z_95) -> tuple[float, float]:
-    """Wilson score interval for a proportion."""
+    """The likely range for a percentage seen `successes` times out of `n`
+    (the Wilson score interval -- a standard closed-form formula)."""
     if n == 0:
         return (math.nan, math.nan)
     p = successes / n

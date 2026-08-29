@@ -163,8 +163,8 @@ def _headline(ev: Evaluation, dd: _Drilldowns, extras: ReportExtras) -> str:
     if extras.clean_rate_ci is not None:
         low, high = extras.clean_rate_ci
         clean_sub += (
-            f' &middot; <span class="ci">95% CI {low * 100:.1f}&ndash;{high * 100:.1f}'
-            " (bootstrap)</span>"
+            f' &middot; <span class="ci">very likely between {low * 100:.1f}% and '
+            f"{high * 100:.1f}%</span>"
         )
     tiles = [
         (
@@ -174,7 +174,7 @@ def _headline(ev: Evaluation, dd: _Drilldowns, extras: ReportExtras) -> str:
         ),
         (
             f"{len(critical_mismatch_rows):,}",
-            f"tier-{tier} field mismatches",
+            f"serious (tier-{tier}) mismatches",
             dd.link(
                 "see the mismatching rows",
                 f"All tier-{tier} mismatches",
@@ -237,17 +237,19 @@ def _regimes_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> s
             f"{(ev.clean_document_rate - gold.clean_document_rate) * 100:+.1f} pp",
         ],
         [
-            f"tier-{tier} mismatch rows (fields + structure)",
+            f"serious (tier-{tier}) mismatches, wrong fields and whole items",
             f"{gold_n:,}", f"{proxy_n:,}", f"{proxy_n - gold_n:+,}",
         ],
         [
-            "straight-through @ 0.80: escaped error rate",
+            "share of auto-accepted docs (at confidence 0.80) carrying a serious error",
             _pct(gold_escape), _pct(proxy_escape),
             f"{(proxy_escape - gold_escape) * 100:+.1f} pp",
         ],
     ]
     table = _raw_table(
-        ["metric", "vs gold (truth)", "vs filed (proxy)", "proxy bias"], body
+        ["metric", "scored against the truth (gold)",
+         "scored against what was filed (proxy)", "difference"],
+        body,
     )
 
     disagreement = ""
@@ -270,12 +272,16 @@ def _regimes_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> s
             hidden, disagreement_cols,
         )
         disagreement = (
-            f"<p>Splitting the proxy's field verdicts by what gold says: {fa_link} "
-            "&mdash; the proxy's noise, overwhelmingly post-filing amendments &mdash; "
-            f"and {hidden_link}, where extraction and filing were wrong the same way. "
-            "The hidden-error count is near zero here because filings are still "
-            "independent of extraction; it is the number that silently grows once "
-            "auto-accepted extractions start being filed verbatim.</p>"
+            "<p>Where the two scorings disagree, one of them is misleading us. "
+            f"{fa_link}: the tool was actually right, but the filed record was "
+            "changed after filing (an amendment), so scoring against the filing "
+            "wrongly blames the tool.  "
+            f"{hidden_link}: the tool agreed with the filing and both were wrong "
+            "&mdash; a mistake no filing-based check can ever see.  That count is "
+            "near zero today because people still file from the paperwork, not "
+            "from the tool's output.  The moment auto-accepted extractions start "
+            "being filed as-is, it grows silently &mdash; and agreement with the "
+            "filing stops meaning anything for those documents.</p>"
         )
 
     audit = ""
@@ -295,33 +301,40 @@ def _regimes_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> s
             ])
         audit_table = _raw_table(
             ["documents audited", "clean in sample", "estimated true clean rate",
-             "95% CI (Wilson)", "CI width"],
+             "likely range (95%)", "width of range"],
             audit_body,
         )
         audit = (
-            "<h3>The production substitute for gold: a graded audit sample</h3>"
-            "<p>In production nobody has truth for the whole population; you buy it "
-            "for a random sample and let the interval speak.  Here the &ldquo;human "
-            f"grading&rdquo; is played by the gold file.  The full-population truth is "
-            f"{_pct(gold.clean_document_rate)}; each interval below should usually "
-            "cover it &mdash; and a 95% interval still misses one run in twenty, "
-            "which is part of what it teaches.  The CI width column is the price "
-            "list for annotation: precision scales with the square root of the "
-            "sample.</p>"
+            "<h3>What to do in production: audit a sample by hand</h3>"
+            "<p>In the real world nobody has the truth for every document.  What "
+            "you can do is pick documents at random, have a person check just "
+            "those against the paperwork, and let that sample speak for the "
+            "whole.  (Here the person is played by the truth file.)  The smaller "
+            "the sample, the wider the range of clean rates it could honestly "
+            "mean &mdash; that width is the price list for human checking: to "
+            "halve it, check four times as many documents.  The true rate is "
+            f"{_pct(gold.clean_document_rate)}; each range below should usually "
+            "contain it, though even a 95% range misses about one run in twenty "
+            "&mdash; which is part of what it teaches.</p>"
             f"{audit_table}"
         )
 
     return (
         "<section><h2>Three ways to score the same extraction</h2>"
-        "<p><strong>Truth</strong> (gold): only exists here because the data is "
-        "synthetic; in production it is a human-graded audit sample.  "
-        "<strong>Proxy</strong> (the filed record): available for every document, "
-        "but days late and noisy &mdash; amendments count as errors, and "
-        "agreement can hide shared mistakes.  <strong>Blind</strong> (validity "
-        "rules + confidence): available instantly with no reference at all; its "
-        "reach is measured in the leading-indicators section below.  The rest of "
-        "this report scores against the proxy, because that is what production "
-        "sees.</p>"
+        "<p>To say the tool got something wrong, you need something to compare "
+        "against &mdash; and there are three candidates, each with a catch.  "
+        "<strong>The truth</strong> (we call it gold): what the paperwork really "
+        "said.  We have it here only because this data is generated; in "
+        "production you buy it in small amounts by having a person check "
+        "documents by hand.  <strong>What was filed</strong> (the proxy, i.e. "
+        "our stand-in for the truth): available for every document, but it "
+        "arrives days later and it is not quite the truth &mdash; filings get "
+        "legitimately corrected after the fact, and sometimes the filing repeats "
+        "the tool's own mistake.  <strong>No answer key at all</strong> (blind): "
+        "the built-in checks and the tool's own confidence scores, available the "
+        "moment a document is processed; how far they reach is measured a few "
+        "sections down.  The rest of this report scores against what was filed, "
+        "because that is all production normally has.</p>"
         f"{table}{disagreement}{audit}</section>"
     )
 
@@ -346,19 +359,21 @@ def _leading_indicators_section(ev: Evaluation, extras: ReportExtras, dd: _Drill
             "&ndash;" if pd.isna(row["lift_vs_base"]) else f"{row['lift_vs_base']:.1f}x",
         ])
     table = _raw_table(
-        ["blind signal (known before filing)", "documents", "with tier-1 mismatch",
-         "mismatch rate", "lift vs base"],
+        ["warning sign (known before filing)", "documents", "with tier-1 mismatch",
+         "mismatch rate", "times the average"],
         body,
     )
     return (
-        "<section><h2>Blind-regime leading indicators</h2>"
-        "<p>In production the proxy arrives days after extraction.  Until then the "
-        "only per-document signals are the validity rules and the confidence "
-        "scores &mdash; so the operational question is how much of the eventual "
-        "damage those signals point at.  The last row is the residual: documents "
-        "that look perfectly clean ex ante and are wrong anyway.  Fabricated "
-        "values &mdash; valid-looking, high-confidence, wrong &mdash; live "
-        "almost entirely in that row.</p>"
+        "<section><h2>Early warning signs, before any filing exists</h2>"
+        "<p>The comparison against the filing only arrives days after extraction.  "
+        "Until then, the only per-document warning signs are the built-in checks "
+        "(validity rules) and the tool's own confidence scores.  This table asks "
+        "how good those warnings are: of the documents each sign flags, how many "
+        "turn out to have a serious (tier-1) error, and how does that compare to "
+        "an average document?  The last row is the uncomfortable one: documents "
+        "with no warning sign at all that are wrong anyway.  Made-up-but-"
+        "plausible values &mdash; which look valid and come with high confidence "
+        "&mdash; live almost entirely in that row.</p>"
         f"{table}</section>"
     )
 
@@ -374,8 +389,8 @@ def _confidence_quality_section(extras: ReportExtras, dd: _Drilldowns) -> str:
         for s in extras.confidence_summaries
     ]
     summary_table = _raw_table(
-        ["scored against", "fields scored", "accuracy", "mean confidence",
-         "ECE", "Brier", "AUROC"],
+        ["scored against", "fields scored", "actually right", "claimed confidence (avg)",
+         "honesty gap (ECE)", "error score (Brier)", "sorting power (AUROC)"],
         body,
     )
     per_field = ""
@@ -401,32 +416,43 @@ def _confidence_quality_section(extras: ReportExtras, dd: _Drilldowns) -> str:
                 _fmt(row["auroc"]),
             ])
         per_field = (
-            "<h3>Per field (vs gold)</h3>"
-            "<p>A pooled score hides that 0.9 on an HS code and 0.9 on a date can "
-            "mean different things.  Positive gap = overconfident.  Click a count "
-            "for that field's true errors, most confident first.</p>"
+            "<h3>The same questions, field by field (scored against the truth)</h3>"
+            "<p>One overall number hides a lot: a 0.9 on an HS code and a 0.9 on "
+            "a date can mean different things.  The gap column is claimed "
+            "confidence minus actual hit rate &mdash; above zero means the tool "
+            "oversells itself on that field, below zero means it undersells.  "
+            "Click a count to see that field's real errors, most confident "
+            "first: those are the ones no review queue would have caught.</p>"
             + _raw_table(
-                ["field", "level", "fields scored", "accuracy", "mean confidence",
-                 "calibration gap", "AUROC"],
+                ["field", "level", "fields scored", "actually right",
+                 "claimed confidence (avg)", "gap", "sorting power (AUROC)"],
                 field_body,
             )
         )
     return (
         "<section><h2>Is the confidence score any good?</h2>"
-        "<p>Two different properties.  <strong>Calibration</strong> (ECE, Brier: "
-        "lower is better): does 0.9 mean 90%?  Fixable after the fact by "
-        "recalibration.  <strong>Discrimination</strong> (AUROC: 1.0 separates "
-        "right from wrong perfectly, 0.5 is noise): do errors rank below correct "
-        "fields at all?  Not fixable by any recalibration &mdash; and the "
-        "auto-accept gate only uses the ranking, so AUROC decides whether a "
-        "confidence gate can work.  Comparing the two rows shows label noise at "
-        "work: against the noisy proxy the same score's discrimination always "
-        "reads lower (AUROC, Brier), while apparent calibration can drift either "
-        "way &mdash; here the noise nudges an underconfident score's ECE slightly "
-        "down, flattering it.  Fabricated errors carry deliberately high "
-        "confidence, which is what keeps AUROC away from 1.0 &mdash; and the "
-        "fields fabrication targets are exactly the ones with the worst AUROC "
-        "below.</p>"
+        "<p>Two separate questions, often mixed up.  <strong>Is it honest?</strong> "
+        "When the tool says 0.9, is it right about 9 times in 10?  The honesty "
+        "gap (ECE) is the average distance between what the score claims and "
+        "how often the tool is actually right &mdash; 0 is perfect.  The error "
+        "score (Brier) measures the same idea but punishes being confidently "
+        "wrong hardest &mdash; again, lower is better.  A dishonest-but-"
+        "consistent score can be repaired: once you know &ldquo;0.9 really "
+        "means 0.8&rdquo;, you relabel it.  <strong>Can it tell right from "
+        "wrong at all?</strong>  Pick one field the tool got right and one it "
+        "got wrong, at random: sorting power (AUROC) is how often the right "
+        "one carries the higher score.  1.0 means always &mdash; a threshold "
+        "can cleanly separate them; 0.5 means the score is a coin flip and no "
+        "threshold anywhere will help.  No relabelling can fix poor sorting "
+        "power, and the auto-accept gate relies on it entirely.</p>"
+        "<p>The two rows below score the very same confidence numbers against "
+        "the truth and against what was filed.  Because the filing is an "
+        "imperfect answer key, the score's sorting power reads lower against "
+        "it than it really is &mdash; judge the tool with noisy answers and "
+        "the tool looks worse.  Note also that the fields where made-up "
+        "values were planted are exactly the ones whose sorting power "
+        "collapses in the table below: confident fabrication is what drags "
+        "it down.</p>"
         f"{summary_table}{per_field}</section>"
     )
 
@@ -472,15 +498,16 @@ def _alignment_section(ev: Evaluation, dd: _Drilldowns) -> str:
         body,
     )
     return (
-        "<section><h2>Goods item alignment</h2>"
-        "<p>Declarations are multi-item, and item numbers cannot be joined on "
-        "&mdash; extraction and filing number lines independently.  Items are "
-        "paired by content (HS code hierarchy, value, origin, quantity; see "
-        "alignment.py), and every pairing carries its stated basis in the "
-        "drill-downs.  A <em>missed</em> item was filed but never extracted "
+        "<section><h2>Matching up the goods items</h2>"
+        "<p>A declaration lists several goods items, and the line numbers are "
+        "no help in matching them up &mdash; the extraction tool and the filing "
+        "system each number their lines independently.  So items are paired by "
+        "how similar their content is (HS code, value, origin, quantity; the "
+        "rules live in alignment.py), and every pairing states its reasoning in "
+        "the drill-downs.  A <em>missed</em> item was filed but never extracted "
         "(a dropped or merged line); a <em>spurious</em> item was extracted "
-        "but never filed (a subtotal or footer read as goods).  Both count "
-        "as mismatches at the tier configured in field_tiers.yaml.</p>"
+        "but never filed (usually a subtotal or footer read as goods).  Both "
+        "count as mismatches, at the severity set in field_tiers.yaml.</p>"
         f"{table}</section>"
     )
 
@@ -515,15 +542,17 @@ def _straight_through_section(ev: Evaluation, dd: _Drilldowns) -> str:
         body,
     )
     return (
-        "<section><h2>Straight-through processing estimate</h2>"
-        "<p>If every document whose critical-tier fields all carry at least this "
-        "confidence were accepted without human review: how much goes straight "
-        "through, and how many bad documents ride along.  Two honest caveats. "
-        "Escapes are measured against the filed record, so legitimate post-filing "
-        "amendments count as escapes &mdash; treat the rate as an upper bound. "
-        "And the gate only sees per-field confidence: a document whose extraction "
-        "silently dropped a goods item still auto-accepts, because the missing "
-        "line has no score to be low.  That is how real confidence gates fail.</p>"
+        "<section><h2>What if we let confident documents through unreviewed?</h2>"
+        "<p>Each row plays out one policy: accept, without human review, every "
+        "document whose most-critical (tier-1) fields all carry at least this "
+        "confidence score.  The table shows how much of the workload would go "
+        "straight through and how many bad documents would ride along.  Two "
+        "honest caveats.  Errors are counted against the filed record, so "
+        "legitimate post-filing amendments count as escapes &mdash; the true "
+        "escape rate can only be lower.  And the gate can only see scores that "
+        "exist: a document whose extraction silently dropped a goods item still "
+        "sails through, because the missing line has no score to be low.  That "
+        "is how confidence gates fail in real life.</p>"
         f"{table}</section>"
     )
 
@@ -552,16 +581,19 @@ def _calibration_section(ev: Evaluation, dd: _Drilldowns) -> str:
             _fmt(row["mean_confidence"]),
         ])
     table = _raw_table(
-        ["confidence bucket", "comparisons", "matches", "mismatches",
-         "observed accuracy", "mean confidence"],
+        ["confidence band", "fields scored", "matched", "mismatched",
+         "actually right", "average claimed confidence"],
         body,
     )
     return (
-        "<section><h2>Confidence calibration</h2>"
-        "<p>Per-field extraction confidence bucketed into deciles, against the "
-        "share of those fields that actually matched the filed value.  If the "
-        "tool's confidence is honest, accuracy climbs with the bucket; flat "
-        "rows mean the score is decoration.</p>"
+        "<section><h2>Does the confidence score mean what it says?</h2>"
+        "<p>Every extracted field comes with a confidence score between 0 and 1.  "
+        "Here those scores are grouped into ten bands, and for each band we ask: "
+        "of the fields the tool scored in this range, how many actually matched "
+        "what was filed?  If the score is honest, the 0.9&ndash;1.0 band should "
+        "be right far more often than the 0.6&ndash;0.7 band.  If the rows look "
+        "the same, the score is decoration and must not be used to decide "
+        "anything.</p>"
         f"{table}</section>"
     )
 
@@ -599,12 +631,15 @@ def _per_field_section(ev: Evaluation, dd: _Drilldowns) -> str:
     )
     return (
         "<section><h2>Per-field precision and recall</h2>"
-        "<p>Precision: when the tool extracted a value and the filing has one, "
-        "how often they agree.  Recall: of the values present in the filing, "
-        "how often the tool produced a matching one (so a field the tool "
-        "skipped hurts recall, not precision).  Item-level fields aggregate "
-        "over aligned item pairs; unmatched items are counted in the "
-        "alignment section above, not here.</p>"
+        "<p>Two questions per field.  <em>Precision</em> &mdash; when the tool "
+        "wrote a value, how often was it the right one?  <em>Recall</em> &mdash; "
+        "of the values that ended up in the filing, how often did the tool "
+        "deliver a matching one?  The difference matters: a field the tool "
+        "left empty doesn't hurt precision (it wrote nothing wrong), but it "
+        "does hurt recall (the filing needed a value it never produced).  "
+        "Item-level rows count every paired goods item; whole items that "
+        "never got paired are counted in the alignment section above, not "
+        "here.</p>"
         f"{table}</section>"
     )
 
@@ -643,7 +678,7 @@ def _breakdown_section(
                     cell_rows, COMPARISON_COLUMNS),
         ])
     table = _raw_table(
-        ["country", "source system", "documents", "clean doc rate [95% CI]",
+        ["country", "source system", "documents", "clean doc rate [likely range]",
          f"tier-{tier} mismatches", f"tier-{tier} mismatch rate", "all mismatches"],
         body,
     )
@@ -652,9 +687,10 @@ def _breakdown_section(
         "<p>Country is the country of filing (taken from the filed record); "
         "source system is the extraction tool that produced the record.  A "
         "single bad cell here usually means bad scans or a bad template for "
-        "that lane, not a globally bad tool.  The intervals (Wilson, 95%) are "
-        "there to stop over-reading small slices: a two-point difference "
-        "between cells whose intervals overlap is not a finding.</p>"
+        "that lane, not a globally bad tool.  The ranges in brackets say how "
+        "much a rate built on this many documents can wobble by pure chance "
+        "&mdash; when two cells' ranges overlap, the difference between them "
+        "may well be luck, not a finding.</p>"
         f"{table}</section>"
     )
 
@@ -692,21 +728,24 @@ def _validity_section(validity: pd.DataFrame | None, dd: _Drilldowns) -> str:
         ])
     table = _raw_table(["rule", "records checked", "failures", "failure rate"], body)
     return (
-        "<section><h2>Validity rules (no ground truth needed)</h2>"
-        "<p>Deterministic checks run on the extracted records alone &mdash; "
-        "format, checksums, reference lists, arithmetic.  These catch problems "
-        "even when the filed record is wrong too.</p>"
+        "<section><h2>Built-in checks (no answer key needed)</h2>"
+        "<p>Fixed, rule-based checks that run on the extracted records alone "
+        "&mdash; is the code well-formed, does the checksum work out, is it on "
+        "the official list, do the numbers add up.  They need nothing to "
+        "compare against, so they work the moment a document is processed, and "
+        "they still catch problems when the filed record is wrong too.</p>"
         f"{table}</section>"
     )
 
 
 def _caveats_section(extra_notes: list[str] | None, has_gold: bool = False) -> str:
     notes = [
-        "Fabricated errors &mdash; a different but valid EORI, an in-tariff HS "
-        "sibling, a wrong-but-real origin &mdash; pass every validity rule and "
-        "carry high confidence.  This is the characteristic LLM failure mode "
-        "(fluent garbage), as opposed to OCR noise (visible garbage), and it is "
-        "why blind monitoring alone cannot carry production.",
+        "Some wrong values look perfectly fine: a valid-but-wrong EORI, a "
+        "different-but-real HS code, a wrong-but-existing origin country.  They "
+        "pass every built-in check and arrive with high confidence.  This is "
+        "how LLM-based extraction typically fails (fluent nonsense), where OCR "
+        "typically fails visibly (mangled digits) &mdash; and it is why the "
+        "built-in checks alone cannot guard production.",
     ]
     if has_gold:
         notes.append(
@@ -716,19 +755,20 @@ def _caveats_section(extra_notes: list[str] | None, has_gold: bool = False) -> s
             "precision costs."
         )
     notes += [
-        "The filed record is <strong>not ground truth</strong>.  Documents get "
+        "The filed record is <strong>not the truth</strong>.  Documents get "
         "legitimately amended after filing (revaluations, corrected counts, "
         "reclassifications), and those amendments appear here as extraction "
-        "mismatches.  Nothing in this report can tell the two apart; the "
-        "mismatch counts are upper bounds on extraction error.",
+        "mismatches.  Nothing in this report can tell the two apart, so every "
+        "mismatch count is a ceiling &mdash; the tool's true error rate can "
+        "only be lower, not higher.",
         "When extraction and filing agree, they can both be wrong.  Agreement "
         "measures consistency, not correctness; only the validity rules catch "
         "some of these cases.",
-        "Item alignment is a greedy heuristic, not truth.  Two same-chapter "
-        "items with similar values can pair the wrong way round, and a merged "
-        "line whose totals happen to equal one filed item pairs cleanly while "
-        "the other filed item is reported missed.  Every pairing's stated "
-        "basis is in the drill-downs so a human can audit it.",
+        "Item pairing is a best guess, not a fact.  Two similar goods lines "
+        "can pair the wrong way round, and a merged line whose totals happen "
+        "to equal one filed item pairs cleanly while the other filed item is "
+        "reported as missed.  Every pairing states its reasoning in the "
+        "drill-downs so a person can check it.",
         "Ambiguous dates (day and month both &le; 12) are resolved by the "
         "configured day-first preference, which can itself be wrong.  Mismatch "
         "reasons flag when a difference would vanish with the order swapped.",

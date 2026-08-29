@@ -199,8 +199,9 @@ def main() -> None:
     )
     gold_quality = summaries[0]
     print(
-        f"      confidence vs gold: AUROC {gold_quality.auroc:.3f}, "
-        f"ECE {gold_quality.ece:.3f}, Brier {gold_quality.brier:.3f}"
+        f"      confidence vs truth: ranks a right field above a wrong one "
+        f"{gold_quality.auroc * 100:.1f}% of the time (AUROC); "
+        f"honesty gap {gold_quality.ece:.3f} (ECE)"
     )
 
     print("[6/7] Synthetic-only diagnostic: which error styles do blind signals catch?")

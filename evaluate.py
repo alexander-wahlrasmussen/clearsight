@@ -532,11 +532,12 @@ def leading_indicators(
     confidence_floor: float = 0.8,
 ) -> LeadingIndicators:
     """The blind-regime question: in production, before any filed record
-    exists, the only per-document signals are validity failures and low
-    confidence.  How much do they tell you about the errors the proxy will
-    eventually reveal?  Lift = a signal's error rate over the base rate;
-    the "neither signal" row is the residual risk no blind gate can see
-    (fabricated-but-plausible values chief among it)."""
+    exists, the only per-document warning signs are a failed validity rule
+    and a low confidence score.  How much do they tell you about the
+    errors the filing comparison will eventually reveal?  "Lift" is plain
+    division: a flagged group's error rate over the everyone rate, so 2.0
+    means twice as likely.  The "neither signal" row is the risk no blind
+    gate can see -- fabricated-but-plausible values chief among it."""
     failed_docs = set(validity_results.loc[~validity_results["passed"], "doc_id"])
     validity_mask = doc_summary["doc_id"].isin(failed_docs)
     confidence = doc_summary["min_critical_confidence"]

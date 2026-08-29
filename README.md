@@ -72,9 +72,11 @@ sides number their lines independently.
 
 `alignment.py` makes that decision explicitly and auditable:
 
-- Items are paired greedily, best pair first, scored on the real HS
-  hierarchy (2 digits = chapter, 4 = heading, 6 = subheading, 8 = CN,
-  10 = TARIC), value closeness, origin agreement and quantity closeness.
+- Items are paired best-looking match first (taken and never
+  reconsidered), scored on how deep their HS codes agree — using the
+  code's real structure: 2 digits = chapter, 4 = heading, 6 = subheading,
+  8 = CN, 10 = TARIC — plus how close the values and quantities are and
+  whether the origins agree.
 - Pairs below the configured `min_score` are refused: better two honest
   unmatched items than one invented pairing.
 - Every accepted pair carries a written basis ("HS agrees to 6 digits;
@@ -86,44 +88,47 @@ sides number their lines independently.
   `field_tiers.yaml` assigns them (tier 1 by default), so a dropped line
   makes a document not clean exactly like a wrong HS code does.
 
-## Three evaluation regimes
+## Three ways to score the same extraction
 
-The same extraction gets scored three ways, because production only ever
-has some of them:
+To say the tool got something wrong you need something to compare
+against, and there are three candidates.  The code calls them *regimes*;
+each has a catch:
 
-- **Truth (gold).**  The generator writes the true records to
-  `data/gold_truth.csv` — same schema as the ledger export, same reader,
-  same evaluator.  This regime only exists here because the data is
-  synthetic; in production its stand-in is a periodically drawn,
-  human-graded audit sample.
-- **Proxy (the filed record).**  Available for every document, but days
-  late and noisy: amendments count as errors, and agreement can hide
-  shared mistakes.  This is what the report's main sections score against,
-  because it is what production sees.
-- **Blind (validity rules + confidence).**  Available instantly, before
-  filing, with no reference at all.
+- **The truth (called "gold" throughout).**  What the paperwork really
+  said.  The generator writes it to `data/gold_truth.csv` — same file
+  layout as the ledger export, same reader, same evaluator.  We only have
+  it because this data is generated; in the real world you buy truth in
+  small amounts by having a person check documents by hand.
+- **What was filed (called the "proxy" — our stand-in for the truth).**
+  Available for every document, but it arrives days later and it is not
+  quite the truth: filings get legitimately corrected after the fact, and
+  sometimes a filing repeats the tool's own mistake.  The report's main
+  sections score against this, because it is all production normally has.
+- **No answer key at all (called "blind").**  The built-in checks and the
+  tool's own confidence scores, available the moment a document is
+  processed.
 
-Having gold and proxy side by side makes the **proxy bias measurable**
-instead of hand-waved: the report shows both clean rates and splits every
-proxy verdict by what gold says — *false alarms* (mismatch vs filed, match
-vs gold: the amendments) and *hidden errors* (match vs filed, mismatch vs
-gold: extraction and filing wrong the same way).  Hidden errors are near
-zero while filings are independent of extraction; they are the number that
-silently grows once auto-accepted extractions start being filed verbatim —
-the feedback loop that eventually makes the proxy metric worthless on the
-auto-accepted segment.
+Having truth and proxy side by side turns "the filed record isn't quite
+the truth" from a caveat into a **measured number**: the report shows both
+clean rates, and sorts every disagreement between the two scorings into
+*false alarms* (the tool was right; the filing was amended afterwards) and
+*hidden errors* (the tool and the filing were wrong in the same way — a
+mistake no filing-based check can ever see).  Hidden errors are near zero
+while people still file from the paperwork; the moment auto-accepted
+extractions start being filed as-is, that number grows silently, and
+"agreement with the filing" stops meaning anything for those documents.
 
-The **audit-sample estimator** (`uncertainty.audit_sample_estimate`) is
-the production bridge: draw K documents, grade only those against truth,
-and the Wilson interval says what the sample is worth.  The report shows
-K = 50/150/500 so the cost-of-precision curve is visible — you don't buy
-gold for the population, you buy a well-drawn sample to calibrate your
-proxy.
+The **audit sample** (`uncertainty.audit_sample_estimate`) is what
+replaces gold in production: pick documents at random, have a person grade
+only those, and use the sample to estimate the true clean rate — with an
+honest range around it that narrows as the sample grows.  The report shows
+samples of 50, 150 and 500 so you can see what precision costs: to halve
+the range, check four times as many documents.
 
-The **leading-indicators table** measures the blind regime: for documents
-flagged by a validity failure or low confidence, how much likelier is an
-eventual tier-1 mismatch (lift over the base rate) — and, in the "neither
-signal" row, how much damage looks perfectly clean ex ante.
+The **early-warning table** measures the blind regime: for documents
+flagged by a failed check or a low confidence score, how much likelier is
+a serious error than for the average document — and, in the "no warning
+sign" row, how much damage looks perfectly clean until the filing lands.
 
 ## OCR noise vs LLM fabrication
 
@@ -141,13 +146,14 @@ fail differently:
   construction, and it is exactly what confidence gates wave through;
 - **structural**: dropped, merged and invented goods items.
 
-`run_demo.py` runs a clearly-labelled synthetic-only diagnostic (it reads
-the truth sidecar, which the harness proper never does) reporting the
-share of each style that any blind signal actually pointed at.  In the
-default run: roughly half of the noise, most of the structural (the
-item-sum rule), and effectively none of the fabrications.  That asymmetry
-is the operational argument for keeping the proxy and audit regimes
-running even when blind monitoring looks healthy.
+`run_demo.py` runs a clearly-labelled synthetic-only check (it reads the
+truth sidecar, which the harness proper never does) reporting, for each
+style, the share of injected errors that any built-in check actually
+pointed at.  In the default run: roughly half of the noise, most of the
+structural errors (the do-the-numbers-add-up rule catches dropped and
+invented lines), and effectively none of the fabrications.  That asymmetry
+is the whole argument for keeping the filing comparison and the human
+audit running even when the built-in checks look healthy.
 
 ## Why clean document rate is the headline
 
@@ -179,49 +185,67 @@ Definitions used (kept deliberately simple):
   pairs; whole missed items are counted in the alignment summary, not
   smeared into per-field recall.)
 
-## Confidence: calibration and straight-through
+## The confidence score: can we trust it, and what can we automate?
 
-The report buckets per-field extraction confidence into deciles and shows
-observed accuracy per bucket.  If confidence means anything, accuracy
-climbs with the bucket; if the row for 0.9–1.0 is not visibly better than
-0.6–0.7, the score is decoration and must not gate anything.
+Every extracted field comes with a confidence score between 0 and 1.  The
+report groups those scores into ten bands and shows, for each band, how
+often the tool was actually right.  If the score means anything, the
+0.9–1.0 band should be right far more often than the 0.6–0.7 band; if the
+rows look the same, the score is decoration and must not be used to
+decide anything.
 
 The straight-through table answers the operational question directly: *if
-we auto-accepted every document whose tier-1 fields all carry confidence ≥
-t*, what share of the workload goes through untouched, and how many bad
-documents ride along?  The auto-accept decision is computed **ex ante**,
-from the extracted record alone — which exposes the ugliest property of
+we accepted, without human review, every document whose tier-1 fields all
+carry confidence ≥ t*, what share of the workload goes through untouched,
+and how many bad documents ride along?  The accept/review decision is
+made the way production would have to make it — from the extracted record
+alone, before any filing exists — which exposes the ugliest property of
 confidence gating: a document whose extraction silently dropped a goods
-item still auto-accepts, because the missing line has no score to be low.
-The escaped-error column includes those documents on purpose.
+item still sails through, because the missing line has no score to be
+low.  The escaped-error column includes those documents on purpose.
 
-`confidence_quality.py` separates the two properties the calibration table
-conflates:
+`confidence_quality.py` separates two questions that sound alike but have
+very different consequences:
 
-- **calibration** (ECE, Brier): does 0.9 mean 90%?  Fixable after the fact
-  by recalibration, if the ranking underneath is sound;
-- **discrimination** (AUROC, the rank-based Mann-Whitney form): do wrong
-  fields score lower than correct ones *at all*?  Not fixable by any
-  recalibration — and the auto-accept gate only uses the ranking, so AUROC
-  is what decides whether a confidence gate can work.
+- **Is the score honest?**  When the tool says 0.9, is it right about 9
+  times in 10?  Measured by the *honesty gap* (the average distance
+  between claimed confidence and the actual hit rate — the technical name
+  is ECE) and the *error score* (which punishes being confidently wrong
+  hardest — the technical name is Brier score).  A dishonest-but-consistent
+  score can be repaired: once you know "0.9 really means 0.8", you relabel
+  it.
+- **Can the score tell right from wrong at all?**  Pick one field the tool
+  got right and one it got wrong, at random: *sorting power* (technical
+  name AUROC) is how often the right one carries the higher score.  1.0
+  means always — a threshold can cleanly separate good from bad; 0.5 means
+  the score is a coin flip.  No relabelling can fix poor sorting power,
+  and the auto-accept gate depends on it entirely.
 
-Both are computed against gold *and* against the proxy, which demonstrates
-label-noise attenuation: the same score's measured discrimination is lower
-against the noisy proxy than it truly is (while apparent calibration can
-drift either way).  Per-field quality matters more than the pooled number:
-a pooled 0.9 hides that 0.9 on an HS code and 0.9 on a date mean different
-things — and in the demo, the fields fabrication targets are precisely the
-ones whose AUROC collapses.
+Both are computed against the truth *and* against the filing, which shows
+a subtle trap: judged with a noisy answer key, the same score's sorting
+power reads lower than it really is.  And the per-field table matters more
+than the overall number — a pooled 0.9 hides that 0.9 on an HS code and
+0.9 on a date mean different things.  In the demo, the fields where
+fabricated values were planted are precisely the ones whose sorting power
+collapses.
 
 ## Error bars
 
-Every headline proportion carries an interval, stdlib-computed
-(`uncertainty.py`): a percentile **bootstrap** (resampling documents) for
-the clean document rate — shown as the general tool that works for any
-statistic — and closed-form **Wilson intervals** for every
-country × source-system slice and the audit samples.  The point of the
-per-slice intervals is to stop over-reading small cells: a two-point
-difference between slices whose intervals overlap is not a finding.
+Every headline percentage carries a range, computed with the standard
+library (`uncertainty.py`).  Two tools, deliberately shown side by side:
+
+- For the headline clean rate, the **bootstrap**: re-draw the same number
+  of documents at random (allowing repeats) hundreds of times and watch
+  how much the rate wobbles.  Crude, general, and honest — it works for
+  any statistic, not just percentages.
+- For every country × source-system slice and the audit samples, the
+  **Wilson interval**: a ready-made formula for "how sure can you be about
+  a percentage based on n cases", instant and well-behaved even for small
+  slices.
+
+The point of the per-slice ranges is to stop people over-reading small
+cells: when two slices' ranges overlap, the difference between them may
+well be luck.
 
 ## Validity rules
 
@@ -259,13 +283,13 @@ Read these before quoting any number from the report.
    agree, both can be wrong.  Agreement measures consistency, not
    correctness.  The validity rules catch some of these cases; most go
    unmeasured.
-3. **Item alignment is a heuristic, not truth.**  Greedy best-first
-   matching is not globally optimal; two same-chapter items with similar
-   values can pair the wrong way round; a merged line whose totals happen
-   to equal one filed item pairs cleanly while the other filed item is
-   reported as missed (which is directionally right but attributes the
-   defect to the wrong shape).  Every pairing's stated basis is in the
-   drill-downs precisely so a human can audit it.
+3. **Item pairing is a best guess, not a fact.**  The pairing takes the
+   best-looking match first and never reconsiders, so two similar goods
+   lines can pair the wrong way round; and a merged line whose totals
+   happen to equal one filed item pairs cleanly while the other filed
+   item is reported as missed (roughly right, but it blames the wrong
+   kind of defect).  Every pairing states its reasoning in the
+   drill-downs precisely so a person can check it.
 4. **Values are invoice values, not customs values.**  No incoterm
    freight/insurance adjustment and no exchange-rate conversion is
    modelled.  Both sides carry invoice-denominated values so the
@@ -347,3 +371,39 @@ systematically ~2.5× worse than DE, because someone's scans always are.
 Confidence scores are imperfectly honest: noise-corrupted fields tend to
 score lower, fabricated fields score high, the distributions overlap, and
 dropped lines produce no score at all.
+
+## Plain-English glossary
+
+The terms below appear in the code, the CSV columns and the report.
+Plain meaning first; use the technical name when talking to a data
+scientist or searching the literature.
+
+| term | plain meaning |
+|---|---|
+| gold / truth | what the paperwork really said.  Synthetic here; a human-graded sample in production |
+| proxy | our stand-in for the truth: the record that ended up filed.  Close, but amended and occasionally wrong itself |
+| blind | judging with no answer key at all: built-in checks plus the tool's confidence scores |
+| regime | which of the three answer keys (gold / proxy / blind) a number was computed against |
+| tier | how much a field matters: tier 1 errors corrupt the filing, tier 2 cause rework, tier 3 are cosmetic (set in field_tiers.yaml) |
+| clean document rate | share of documents with zero tier-1 problems — the headline number |
+| precision | when the tool wrote a value, how often it was the right one |
+| recall | of the values that ended up filed, how often the tool delivered a matching one.  An empty field hurts recall, not precision |
+| calibration / honesty | whether a claimed confidence of 0.9 really means right 9 times in 10 |
+| ECE ("honesty gap") | average distance between claimed confidence and the actual hit rate; 0 is perfect |
+| Brier score ("error score") | like the honesty gap, but punishes being confidently wrong hardest; lower is better |
+| AUROC ("sorting power") | pick one right field and one wrong field at random: how often the right one has the higher confidence.  1.0 = always, 0.5 = coin flip |
+| confidence interval / likely range | the band a percentage could honestly be in, given how many cases it was computed from.  A 95% range still misses about one run in twenty |
+| bootstrap | estimate that band by re-drawing the documents at random hundreds of times and watching the number wobble |
+| Wilson interval | a ready-made formula for that band when the number is a simple percentage |
+| lift ("times the average") | how much likelier an error is for flagged documents than for the average document |
+| false alarm | the tool was right, but the filing was changed afterwards, so the comparison blames the tool |
+| hidden error | the tool and the filing are wrong in the same way — invisible to any filing-based check |
+| amendment | a legitimate change to a filing after the fact (revaluation, corrected count, reclassification) |
+| noise (error style) | OCR-era mistakes: mangled digits, truncated codes, missing fields.  Often looks broken, so checks catch a fair share |
+| fabrication (error style) | LLM-era mistakes: valid-looking, high-confidence, wrong.  Passes every check by construction |
+| structural (error style) | whole goods lines dropped, merged, or invented from a subtotal row |
+| alignment | pairing each extracted goods item with the filed item it most plausibly corresponds to |
+| missed / spurious item | a filed item with no extracted partner / an extracted item with no filed partner |
+| straight-through | accepting a document without human review because its confidence scores clear a threshold |
+| escaped error | a bad document that a straight-through policy would have accepted |
+

@@ -1,27 +1,29 @@
 """How good are the confidence scores themselves?
 
-Two different questions, routinely conflated:
+Two different questions, routinely mixed up:
 
-- CALIBRATION: when the tool says 0.9, is it right 90% of the time?
-  Measured by the reliability table (evaluate.py's calibration frame), and
-  summarised here by ECE and the Brier score.  Bad calibration can be
-  repaired after the fact (recalibration maps claimed scores to observed
-  rates) -- IF the ranking underneath is sound.
-- DISCRIMINATION: do wrong fields score lower than correct ones at all?
-  Measured by AUROC: the probability that a randomly chosen correct field
-  outranks a randomly chosen wrong one.  Bad discrimination cannot be
-  repaired by any recalibration, and the straight-through gate only ever
-  uses the ranking -- so AUROC, not ECE, is what decides whether a
-  confidence gate can work.
+- IS THE SCORE HONEST?  (the literature says "calibration")  When the
+  tool says 0.9, is it right about 9 times in 10?  Shown in full by the
+  band-by-band table (evaluate.py's calibration frame) and summarised
+  here by the honesty gap (ECE) and the error score (Brier).  A
+  dishonest-but-consistent score can be repaired after the fact: once you
+  know "0.9 really means 0.8", you relabel it -- IF the ordering
+  underneath is sound.
+- CAN IT TELL RIGHT FROM WRONG AT ALL?  (the literature says
+  "discrimination")  Pick one field the tool got right and one it got
+  wrong at random: the sorting power (AUROC) is how often the right one
+  carries the higher score.  Poor sorting power cannot be repaired by any
+  relabelling, and the straight-through gate relies on the ordering
+  alone -- so AUROC, not ECE, decides whether a confidence gate can work.
 
 All metrics run over "scored" rows: a confidence is present and the
 comparator reached a definite match/mismatch verdict.  Computed against
-the gold regime they describe the score's true quality; computed against
-the filed proxy they come out worse than reality, because label noise
-(amendments) counts calibrated correct answers as errors.  Showing both is
-the lesson.
+the gold truth they describe the score's real quality; computed against
+the filed record they read somewhat worse, because a noisy answer key
+counts some genuinely correct answers as errors.  Showing both is the
+lesson.
 
-Plain pandas and stdlib; AUROC is the rank-based Mann-Whitney form.
+Plain pandas and stdlib throughout.
 """
 
 from __future__ import annotations
@@ -44,9 +46,12 @@ def scored_rows(comparisons: pd.DataFrame) -> pd.DataFrame:
 
 
 def brier_score(scored: pd.DataFrame) -> float:
-    """Mean squared error of the confidence against the 0/1 outcome.
-    0 is perfect; 0.25 is what a coin-flip outcome with a constant 0.5
-    score earns.  A proper scoring rule: it rewards honesty."""
+    """The "error score": how far each confidence sat from what actually
+    happened (1 for a match, 0 for a mismatch), squared and averaged.
+    Squaring makes confidently-wrong hurt far more than hesitantly-wrong.
+    0 is perfect; a constant 0.5 score on coin-flip outcomes earns 0.25.
+    (In the literature: a proper scoring rule -- the best strategy is to
+    report what you truly believe.)"""
     if scored.empty:
         return math.nan
     outcome = (scored["status"] == MATCH).astype(float)
@@ -54,9 +59,11 @@ def brier_score(scored: pd.DataFrame) -> float:
 
 
 def expected_calibration_error(scored: pd.DataFrame, n_bins: int = 10) -> float:
-    """ECE: the reliability table collapsed to one number -- the average
-    |claimed confidence - observed accuracy| across bins, weighted by how
-    many fields land in each bin."""
+    """The "honesty gap" (ECE): group scores into bands, and in each band
+    take the distance between the average claimed confidence and the share
+    that were actually right; average those distances, weighting each band
+    by how many fields landed in it.  0 means the score keeps its
+    promises."""
     if scored.empty:
         return math.nan
     bins = (scored["confidence"] * n_bins).astype(int).clip(upper=n_bins - 1)
@@ -69,11 +76,12 @@ def expected_calibration_error(scored: pd.DataFrame, n_bins: int = 10) -> float:
 
 
 def auroc(scored: pd.DataFrame) -> float:
-    """Probability that a random correct field carries a higher confidence
-    than a random wrong one (ties count half).  1.0 = the score separates
-    right from wrong perfectly; 0.5 = the score is noise.  Rank-based
-    (Mann-Whitney), so it only sees the ordering -- exactly what a
-    threshold gate sees."""
+    """The "sorting power" (AUROC): pick one field the tool got right and
+    one it got wrong, at random -- how often does the right one carry the
+    higher confidence?  (Ties count half.)  1.0 = the score separates
+    right from wrong perfectly; 0.5 = coin flip.  Computed from the
+    ordering of the scores only (the Mann-Whitney rank form), which is
+    exactly what a threshold gate sees."""
     is_match = scored["status"] == MATCH
     n_pos = int(is_match.sum())
     n_neg = len(scored) - n_pos
