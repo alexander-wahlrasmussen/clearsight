@@ -151,6 +151,34 @@ NOISE = "noise"               # OCR-era: garbage that often looks like garbage
 FABRICATION = "fabrication"   # LLM-era: valid-looking, high-confidence, wrong
 STRUCTURAL = "structural"     # whole goods items dropped / merged / invented
 
+# Model profiles for the A/B demo (generate_ab): per-rate multipliers on
+# RATES, so the same documents can be "extracted" by two different kinds of
+# tool.  The OCR model barely fabricates (it mangles what it sees); the LLM
+# model reads mangled scans far better but makes things up and invents
+# lines from subtotals -- each model failing in its own characteristic way.
+MODEL_PROFILES: dict[str, dict[str, float]] = {
+    "ocr_model": {
+        "eori_fabricated": 0.2, "hs_fabricated": 0.15, "origin_fabricated": 0.15,
+    },
+    "llm_model": {
+        # reads through the noise...
+        "total_ocr": 0.3, "item_value_ocr": 0.3, "weight_ocr": 0.3,
+        "eori_digit": 0.25, "bl_ocr": 0.4, "hs_truncate": 0.25, "hs_digit": 0.3,
+        "date_swap": 0.4, "quantity_slip": 0.5, "package_off_by_one": 0.5,
+        "unit_wrong": 0.6, "origin_missing": 0.4, "net_exceeds_gross": 0.6,
+        "currency_wrong": 0.6, "incoterm_confusion": 0.6,
+        # ...but fabricates and invents lines
+        "eori_fabricated": 2.5, "hs_fabricated": 2.0, "origin_fabricated": 2.0,
+        "drop_item": 0.5, "merge_items": 0.8, "spurious_item": 1.5,
+    },
+}
+
+
+def profile_rates(model: str) -> dict[str, float]:
+    """RATES with one model profile's multipliers applied."""
+    multipliers = MODEL_PROFILES[model]
+    return {name: rate * multipliers.get(name, 1.0) for name, rate in RATES.items()}
+
 OCR_DIGIT_CONFUSION = {"0": "8", "1": "7", "2": "7", "3": "8", "4": "9",
                        "5": "6", "6": "5", "7": "1", "8": "3", "9": "4"}
 BL_CHAR_CONFUSION = {"0": "O", "O": "0", "1": "I", "I": "1",
@@ -417,14 +445,16 @@ def _describe_true_item(item: TrueItem) -> str:
 
 
 def _corrupt_for_extraction(
-    doc: TrueDoc, rng: random.Random
+    doc: TrueDoc, rng: random.Random, rates: dict[str, float] | None = None
 ) -> tuple[dict, dict[str, float], list[ExtractedItem], list[dict]]:
     """Return (extracted header, header confidence, extracted items,
-    injected error rows for the truth sidecar)."""
+    injected error rows for the truth sidecar).  `rates` defaults to the
+    module RATES; generate_ab passes a model profile's rates instead."""
+    rates = rates if rates is not None else RATES
     multiplier = BAD_COUNTRY_MULTIPLIER if doc.country == BAD_COUNTRY else 1.0
 
     def hit(rate_name: str) -> bool:
-        return rng.random() < min(RATES[rate_name] * multiplier, 0.95)
+        return rng.random() < min(rates[rate_name] * multiplier, 0.95)
 
     error_rows: list[dict] = []
 
@@ -840,6 +870,8 @@ def _write_injected_errors_csv(rows: list[dict], path: Path) -> None:
         "doc_id", "item_number", "field", "kind", "style",
         "value_on_document", "extracted_value",
     ]
+    if rows and "model" in rows[0]:  # A/B data: which model made the error
+        columns = ["model"] + columns
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns)
         writer.writeheader()
@@ -911,6 +943,78 @@ def generate(n_docs: int = 3000, seed: int = 42, data_dir: str | Path = "data") 
         "n_noise_errors": styles.count(NOISE),
         "n_fabrications": styles.count(FABRICATION),
         "n_structural_errors": styles.count(STRUCTURAL),
+        "paths": {name: str(p) for name, p in paths.items()},
+    }
+
+
+def generate_ab(
+    n_docs: int = 3000,
+    seed: int = 42,
+    data_dir: str | Path = "data/ab",
+    models: tuple[str, ...] = ("ocr_model", "llm_model"),
+) -> dict:
+    """A/B data: the SAME documents extracted by several models, each with
+    its own failure profile (see MODEL_PROFILES), against ONE shared filed
+    ledger and ONE shared gold truth -- the setup a fair model comparison
+    needs.  Every model's output is written in the Acme flat-CSV format as
+    extracted_<model>.csv; read it with
+    readers.acme_csv.read(path, source_system=<model>)."""
+    rng = random.Random(seed)
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    docs = [_make_true_doc(i, rng) for i in range(n_docs)]
+
+    # The reference side exists once: same filings, same amendments, same
+    # truth, whichever model is being judged.
+    filed_entries = []
+    amendment_rows: list[dict] = []
+    for doc in docs:
+        filed_items, filed_total, amendments = _file_with_possible_amendment(doc, rng)
+        filed_entries.append((doc, filed_items, filed_total))
+        amendment_rows.extend(amendments)
+
+    paths = {
+        "filed_csv": data_dir / "filed_customs_ledger.csv",
+        "gold_csv": data_dir / "gold_truth.csv",
+        "tariff_csv": data_dir / "tariff_codes.csv",
+        "amendments_csv": data_dir / "amendments_truth.csv",
+        "errors_csv": data_dir / "injected_errors_truth.csv",
+    }
+    _write_filed_csv(filed_entries, paths["filed_csv"])
+    _write_filed_csv([(doc, doc.items, doc.invoice_total) for doc in docs], paths["gold_csv"])
+    _write_tariff_csv(paths["tariff_csv"])
+    _write_amendments_csv(amendment_rows, paths["amendments_csv"])
+
+    injected_error_rows: list[dict] = []
+    error_counts: dict[str, int] = {}
+    for model in models:
+        rates = profile_rates(model)
+        # A separate deterministic stream per model: the models' mistakes
+        # must be independent of each other, not copies.
+        model_rng = random.Random(f"{seed}/{model}")
+        entries = []
+        n_errors = 0
+        for doc in docs:
+            header, header_conf, items, error_rows = _corrupt_for_extraction(
+                doc, model_rng, rates
+            )
+            entries.append((doc, header, header_conf, items))
+            n_errors += len(error_rows)
+            injected_error_rows.extend({"model": model} | row for row in error_rows)
+        path = data_dir / f"extracted_{model}.csv"
+        _write_acme_csv(entries, path)
+        paths[f"extracted_{model}"] = path
+        error_counts[model] = n_errors
+    _write_injected_errors_csv(injected_error_rows, paths["errors_csv"])
+
+    return {
+        "n_docs": n_docs,
+        "n_items": sum(len(doc.items) for doc in docs),
+        "seed": seed,
+        "models": list(models),
+        "n_amended_docs": len({row["doc_id"] for row in amendment_rows}),
+        "errors_per_model": error_counts,
         "paths": {name: str(p) for name, p in paths.items()},
     }
 

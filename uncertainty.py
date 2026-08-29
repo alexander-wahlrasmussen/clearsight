@@ -50,6 +50,50 @@ def bootstrap_rate_ci(
     return (rates[low_index], rates[high_index])
 
 
+def paired_bootstrap_diff_ci(
+    flags_a, flags_b, n_boot: int = 500, seed: int = 1, alpha: float = 0.05
+) -> tuple[float, float]:
+    """The likely range for the DIFFERENCE between two models' rates, when
+    both lists describe the SAME documents in the same order.
+
+    Resampling whole documents (each carrying both models' outcomes at
+    once) keeps the pairing intact, which is what makes this range much
+    tighter than comparing two separate ranges: on shared documents the
+    models mostly succeed and fail together, and the pairing cancels that
+    shared part out.  Positive means A is better."""
+    pairs = [(bool(a), bool(b)) for a, b in zip(flags_a, flags_b, strict=True)]
+    n = len(pairs)
+    if n == 0:
+        return (math.nan, math.nan)
+    rng = random.Random(seed)
+    diffs = []
+    for _ in range(n_boot):
+        resample = rng.choices(pairs, k=n)
+        diffs.append(
+            (sum(a for a, _ in resample) - sum(b for _, b in resample)) / n
+        )
+    diffs.sort()
+    low_index = int((alpha / 2) * n_boot)
+    high_index = min(n_boot - 1, int((1 - alpha / 2) * n_boot))
+    return (diffs[low_index], diffs[high_index])
+
+
+def chance_split_is_luck(wins_a: int, wins_b: int) -> float:
+    """Among the documents where exactly one model was clean, how likely is
+    a split at least this lopsided if the models were really equally good
+    (i.e. every such document a 50/50 coin flip)?
+
+    Small values mean the winner is real; anything above ~0.05 means the
+    split proves nothing yet.  (This is the exact two-sided sign test that
+    statisticians reach for on paired yes/no outcomes -- McNemar's test.)"""
+    n = wins_a + wins_b
+    if n == 0:
+        return 1.0  # no disagreements: nothing to distinguish the models
+    k = min(wins_a, wins_b)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * tail)
+
+
 def wilson_interval(successes: int, n: int, z: float = Z_95) -> tuple[float, float]:
     """The likely range for a percentage seen `successes` times out of `n`
     (the Wilson score interval -- a standard closed-form formula)."""

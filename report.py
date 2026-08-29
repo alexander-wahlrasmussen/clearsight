@@ -16,6 +16,7 @@ from pathlib import Path
 import pandas as pd
 
 from comparators import MISMATCH
+from compare_models import HeadToHead, ModelComparison
 from confidence_quality import ConfidenceQualitySummary
 from evaluate import Evaluation, LeadingIndicators
 from uncertainty import AuditEstimate
@@ -844,44 +845,297 @@ document.addEventListener('click', function (event) {
 """
 
 
-def build_report(
-    evaluation: Evaluation,
-    validity_results: pd.DataFrame | None,
+# ---------------------------------------------------------------------------
+# the model comparison report (A/B)
+# ---------------------------------------------------------------------------
+
+
+def _luck_text(probability: float) -> str:
+    if pd.isna(probability):
+        return "&ndash;"
+    if probability < 0.001:
+        return "less than 0.1% of the time"
+    if probability < 0.01:
+        return f"about {probability * 100:.1f}% of the time"
+    return f"about {probability * 100:.0f}% of the time"
+
+
+def _critical_rows_for_docs(ev: Evaluation, doc_ids) -> pd.DataFrame:
+    c = ev.comparisons
+    return c[
+        c["doc_id"].isin(doc_ids)
+        & (c["status"] == MISMATCH)
+        & (c["tier"] == ev.critical_tier)
+    ].sort_values(["doc_id", "tier"])
+
+
+def _comparison_tiles(comparison: ModelComparison, dd: _Drilldowns) -> str:
+    tiles = []
+    for _, row in comparison.summary.iterrows():
+        model = row["model"]
+        ev = comparison.evaluations[model]
+        dirty = ev.doc_summary[~ev.doc_summary["clean"]]
+        sub = dd.link(
+            f"{len(dirty)} documents not clean",
+            f"{model}: documents with a serious (tier-{ev.critical_tier}) mismatch",
+            dirty,
+            DOC_COLUMNS_BASE + ["critical_mismatches", "missed_items", "spurious_items"],
+        )
+        sub += (
+            f' &middot; <span class="ci">very likely between '
+            f'{row["clean_ci_low"] * 100:.1f}% and {row["clean_ci_high"] * 100:.1f}%</span>'
+        )
+        tiles.append(
+            f'<div class="tile"><div class="num">{_pct(row["clean_document_rate"])}</div>'
+            f'<div class="label">{esc(model)} clean document rate</div>'
+            f'<div class="sub">{sub}</div></div>'
+        )
+    if len(comparison.head_to_head) == 1:
+        h = comparison.head_to_head[0]
+        low, high = h.diff_ci
+        tiles.append(
+            f'<div class="tile"><div class="num">{h.clean_rate_diff * 100:+.1f} pp</div>'
+            f'<div class="label">{esc(h.model_a)} minus {esc(h.model_b)}</div>'
+            f'<div class="sub"><span class="ci">very likely between {low * 100:+.1f} and '
+            f"{high * 100:+.1f} points</span></div></div>"
+        )
+    return f'<section><div class="tiles">{"".join(tiles)}</div></section>'
+
+
+def _head_to_head_section(
+    h: HeadToHead, comparison: ModelComparison,
+    gold_comparison: ModelComparison | None, dd: _Drilldowns,
+) -> str:
+    ev_a = comparison.evaluations[h.model_a]
+    ev_b = comparison.evaluations[h.model_b]
+    n = h.documents
+
+    def share(count: int) -> str:
+        return _pct(count / n) if n else "&ndash;"
+
+    body = [
+        ["clean under both models", f"{h.both_clean:,}", share(h.both_clean)],
+        [
+            f"only {esc(h.model_a)} clean ({esc(h.model_a)} wins)",
+            dd.link(f"{h.only_a_clean:,}",
+                    f"Why {h.model_b} lost these documents (its serious mismatches)",
+                    _critical_rows_for_docs(ev_b, h.only_a_doc_ids), COMPARISON_COLUMNS),
+            share(h.only_a_clean),
+        ],
+        [
+            f"only {esc(h.model_b)} clean ({esc(h.model_b)} wins)",
+            dd.link(f"{h.only_b_clean:,}",
+                    f"Why {h.model_a} lost these documents (its serious mismatches)",
+                    _critical_rows_for_docs(ev_a, h.only_b_doc_ids), COMPARISON_COLUMNS),
+            share(h.only_b_clean),
+        ],
+        ["clean under neither", f"{h.neither_clean:,}", share(h.neither_clean)],
+    ]
+    table = _raw_table(["outcome, per document", "documents", "share"], body)
+
+    discordant = h.only_a_clean + h.only_b_clean
+    winner = h.model_a if h.only_a_clean >= h.only_b_clean else h.model_b
+    wins = max(h.only_a_clean, h.only_b_clean)
+    losses = min(h.only_a_clean, h.only_b_clean)
+    luck = h.chance_split_is_luck
+    if discordant == 0:
+        verdict = "The models never disagreed on a document; nothing separates them here."
+    elif luck < 0.05:
+        verdict = (
+            f"Of the {discordant:,} documents where exactly one model was clean, "
+            f"{esc(winner)} won {wins:,} and lost {losses:,}.  If the models were "
+            f"equally good, a split this lopsided would happen by luck "
+            f"{_luck_text(luck)} &mdash; the difference is real."
+        )
+    else:
+        verdict = (
+            f"Of the {discordant:,} documents where exactly one model was clean, "
+            f"{esc(winner)} won {wins:,} and lost {losses:,}.  A split like this "
+            f"happens by luck {_luck_text(luck)} between equally good models "
+            "&mdash; this run does not separate them; more documents would."
+        )
+
+    gold_note = ""
+    if gold_comparison is not None:
+        match = next(
+            (g for g in gold_comparison.head_to_head
+             if (g.model_a, g.model_b) == (h.model_a, h.model_b)),
+            None,
+        )
+        if match is not None:
+            low, high = match.diff_ci
+            gold_note = (
+                f"<p><strong>Truth check:</strong> scored against the gold truth "
+                f"instead of the filing, the difference is "
+                f"{match.clean_rate_diff * 100:+.1f} points (very likely between "
+                f"{low * 100:+.1f} and {high * 100:+.1f}) &mdash; the filing-based "
+                f"verdict {'points the same way' if (match.clean_rate_diff >= 0) == (h.clean_rate_diff >= 0) else 'points the OTHER way; trust the truth'}.</p>"
+            )
+
+    return (
+        f"<section><h2>Head to head: {esc(h.model_a)} vs {esc(h.model_b)}</h2>"
+        "<p>Both models saw the same documents, so each document can be scored "
+        "as a small contest.  This is far more decisive than comparing two "
+        "overall rates: documents both models get right, both get wrong, or "
+        "that were amended after filing land in the agreeing rows and cancel "
+        "out &mdash; the disagreement rows are the actual evidence.  Click a "
+        "win count to see exactly why the losing model failed those "
+        "documents.</p>"
+        f"{table}<p>{verdict}</p>{gold_note}</section>"
+    )
+
+
+def _comparison_summary_section(comparison: ModelComparison, dd: _Drilldowns) -> str:
+    body = []
+    for _, row in comparison.summary.iterrows():
+        model = row["model"]
+        ev = comparison.evaluations[model]
+        critical = ev.comparisons[
+            (ev.comparisons["status"] == MISMATCH)
+            & (ev.comparisons["tier"] == ev.critical_tier)
+        ]
+        body.append([
+            esc(model),
+            f"{int(row['documents']):,}",
+            _pct_with_ci(row["clean_document_rate"],
+                         (row["clean_ci_low"], row["clean_ci_high"])),
+            dd.link(f"{int(row['critical_mismatches']):,}",
+                    f"{model}: all serious mismatches",
+                    critical.sort_values("confidence", ascending=False),
+                    COMPARISON_COLUMNS),
+            f"{int(row['missed_items']):,}",
+            f"{int(row['spurious_items']):,}",
+            _pct(row["escaped_rate_at_080"]),
+            _fmt(row["auroc"]),
+            _fmt(row["ece"]),
+        ])
+    table = _raw_table(
+        ["model", "documents", "clean doc rate [likely range]", "serious mismatches",
+         "missed items", "spurious items", "escapes @ 0.80",
+         "sorting power (AUROC)", "honesty gap (ECE)"],
+        body,
+    )
+    return (
+        "<section><h2>Model scorecards, side by side</h2>"
+        f"<p>All numbers scored against {esc(comparison.reference)}.  The clean "
+        "rate is the headline, but the character columns matter as much: a "
+        "model can win on clean rate while inventing more goods lines "
+        "(spurious items) or carrying a less trustworthy confidence score "
+        "(sorting power) &mdash; different failure styles need different "
+        "safety nets around them.</p>"
+        f"{table}</section>"
+    )
+
+
+def _per_field_comparison_section(comparison: ModelComparison, dd: _Drilldowns) -> str:
+    models = list(comparison.evaluations)
+    body = []
+    for _, row in comparison.per_field.iterrows():
+        cells = [esc(row["field"]), esc(row["level"]), str(int(row["tier"]))]
+        for model in models:
+            ev = comparison.evaluations[model]
+            mismatches = ev.comparisons[
+                (ev.comparisons["field"] == row["field"])
+                & (ev.comparisons["status"] == MISMATCH)
+            ]
+            cells.append(
+                dd.link(_pct(row[model]),
+                        f"{model}: mismatches on {row['field']}",
+                        mismatches.sort_values("confidence", ascending=False),
+                        COMPARISON_COLUMNS)
+            )
+        cells.append(f"{row['spread'] * 100:.1f} pp")
+        body.append(cells)
+    table = _raw_table(
+        ["field", "level", "tier"]
+        + [f"{esc(m)} mismatch rate" for m in models]
+        + ["gap between models"],
+        body,
+    )
+    return (
+        "<section><h2>Where the choice of model actually matters</h2>"
+        "<p>Mismatch rate per field, one column per model, sorted by how far "
+        "the models are apart.  The fields at the top are the ones the A/B "
+        "decision is really about; fields at the bottom would look the same "
+        "whichever model you pick.</p>"
+        f"{table}</section>"
+    )
+
+
+def _comparison_caveats(
+    comparison: ModelComparison, gold_comparison: ModelComparison | None
+) -> str:
+    notes = list(comparison.warnings)
+    if gold_comparison is not None:
+        notes.extend(w for w in gold_comparison.warnings if w not in notes)
+    notes += [
+        "A fair A/B needs the same documents, the same reference records, the "
+        "same field_tiers.yaml and the same comparator versions for every "
+        "model.  The versions are recorded on every row precisely so this "
+        "can be checked; violations are flagged at the top of this list.",
+        "Per-model depth (built-in checks, confidence bands, country "
+        "breakdowns) lives in each model's own full report; this page only "
+        "compares.",
+        "The overall rates inherit every caveat of the reference they were "
+        "scored against &mdash; but the head-to-head is largely immune to "
+        "amendment noise, because an amended filing trips both models "
+        "equally and cancels out of the disagreement rows.",
+    ]
+    items = "".join(f"<li>{note}</li>" for note in notes)
+    return (
+        '<section class="caveats"><h2>Read this before declaring a winner</h2>'
+        f"<ul>{items}</ul></section>"
+    )
+
+
+def build_comparison_report(
+    comparison: ModelComparison,
     out_path: str | Path,
-    extras: ReportExtras | None = None,
+    gold_comparison: ModelComparison | None = None,
     generated_at: datetime | None = None,
 ) -> Path:
-    extras = extras or ReportExtras()
     dd = _Drilldowns()
-    generated_at = generated_at or datetime.now()
-    sections = [
-        _headline(evaluation, dd, extras),
-        _regimes_section(evaluation, extras, dd),
-        _alignment_section(evaluation, dd),
-        _straight_through_section(evaluation, dd),
-        _leading_indicators_section(evaluation, extras, dd),
-        _calibration_section(evaluation, dd),
-        _confidence_quality_section(extras, dd),
-        _per_field_section(evaluation, dd),
-        _breakdown_section(evaluation, dd, extras.breakdown_ci),
-        _worst_mismatches_section(evaluation),
-        _validity_section(validity_results, dd),
-        _caveats_section(extras.extra_notes, has_gold=extras.gold_evaluation is not None),
+    sections = [_comparison_tiles(comparison, dd)]
+    for h in comparison.head_to_head:
+        sections.append(_head_to_head_section(h, comparison, gold_comparison, dd))
+    sections += [
+        _comparison_summary_section(comparison, dd),
+        _per_field_comparison_section(comparison, dd),
+        _comparison_caveats(comparison, gold_comparison),
     ]
+    return _write_page(
+        out_path,
+        "Extraction model comparison",
+        f"all models scored against {esc(comparison.reference)} "
+        "&middot; every number links to the rows behind it",
+        sections,
+        dd,
+        generated_at,
+    )
+
+
+def _write_page(
+    out_path: str | Path,
+    title: str,
+    meta: str,
+    sections: list[str],
+    dd: _Drilldowns,
+    generated_at: datetime | None,
+) -> Path:
+    generated_at = generated_at or datetime.now()
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Extraction quality report</title>
+<title>{esc(title)}</title>
 <style>{_CSS}</style>
 </head>
 <body>
 <main>
-<h1>Extraction quality report</h1>
+<h1>{esc(title)}</h1>
 <div class="meta">Generated {esc(generated_at.strftime('%Y-%m-%d %H:%M'))}
- &middot; every number links to the rows behind it
- &middot; full row-level data in the out/ CSVs</div>
+ &middot; {meta}</div>
 {"".join(sections)}
 <div id="drilldowns"><h2>Underlying rows</h2>
 <p>These tables open when you click a number above.</p>
@@ -896,3 +1150,36 @@ def build_report(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(page, encoding="utf-8")
     return out_path
+
+
+def build_report(
+    evaluation: Evaluation,
+    validity_results: pd.DataFrame | None,
+    out_path: str | Path,
+    extras: ReportExtras | None = None,
+    generated_at: datetime | None = None,
+) -> Path:
+    extras = extras or ReportExtras()
+    dd = _Drilldowns()
+    sections = [
+        _headline(evaluation, dd, extras),
+        _regimes_section(evaluation, extras, dd),
+        _alignment_section(evaluation, dd),
+        _straight_through_section(evaluation, dd),
+        _leading_indicators_section(evaluation, extras, dd),
+        _calibration_section(evaluation, dd),
+        _confidence_quality_section(extras, dd),
+        _per_field_section(evaluation, dd),
+        _breakdown_section(evaluation, dd, extras.breakdown_ci),
+        _worst_mismatches_section(evaluation),
+        _validity_section(validity_results, dd),
+        _caveats_section(extras.extra_notes, has_gold=extras.gold_evaluation is not None),
+    ]
+    return _write_page(
+        out_path,
+        "Extraction quality report",
+        "every number links to the rows behind it &middot; full row-level data in the out/ CSVs",
+        sections,
+        dd,
+        generated_at,
+    )

@@ -16,7 +16,8 @@ Netherlands**, with 1–5 goods items per declaration.
 ```bash
 pip install -r requirements.txt   # Python 3.10+; pandas and PyYAML only
 python run_demo.py        # generates data, evaluates, opens out/report.html
-pytest                    # unit tests plus an end-to-end smoke test
+python run_ab_demo.py     # two models, same documents -> out/ab/comparison.html
+pytest                    # unit tests plus end-to-end smoke tests
 ```
 
 `run_demo.py` writes synthetic source files to `data/`, row-level results
@@ -129,6 +130,55 @@ The **early-warning table** measures the blind regime: for documents
 flagged by a failed check or a low confidence score, how much likelier is
 a serious error than for the average document — and, in the "no warning
 sign" row, how much damage looks perfectly clean until the filing lands.
+
+## Comparing models head-to-head (A/B)
+
+To decide between two extraction models, run both over the **same
+documents**, judge both against the **same** filed records, and let
+`compare_models.compare()` line them up.  With real data:
+
+```python
+from readers import acme_csv, customs_ledger
+import compare_models, evaluate
+
+tiers = evaluate.load_field_tiers("field_tiers.yaml")
+filed = customs_ledger.read("filed_export.csv")
+evaluations = {
+    "model_a": evaluate.evaluate(acme_csv.read("a.csv", source_system="model_a"), filed, tiers),
+    "model_b": evaluate.evaluate(acme_csv.read("b.csv", source_system="model_b"), filed, tiers),
+}
+comparison = compare_models.compare(evaluations, "the filed records")
+```
+
+(`python run_ab_demo.py` does exactly this with generated data: an
+OCR-style model and an LLM-style model extracting the same 3,000
+documents.)
+
+Because every model saw the same documents, the comparison is **paired**
+— scored document by document — which is what makes it decisive:
+
+- The four-way split (clean under both / only A / only B / neither) is
+  the actual evidence.  Documents both models get right or wrong together
+  — including ones whose filings were amended — land in the agreeing rows
+  and cancel out.
+- The difference in clean rates gets a likely range from resampling the
+  paired documents, far tighter than comparing two separate ranges.
+- The win/loss split among the disagreement documents gets a plain
+  **"chance it's luck"** number: how often a split at least this lopsided
+  would occur between equally good models.  Below ~5%, the winner is
+  real; above it, the run does not separate the models and you need more
+  documents.  (Statisticians call this exact test McNemar's / the sign
+  test.)
+
+Fairness is checked, not assumed: differing document sets or differing
+comparator versions between the runs land in `comparison.warnings` and at
+the top of the report's caveats.  The comparison report
+(`out/ab/comparison.html`) also shows each model's failure *character* —
+missed and spurious items, escapes at the auto-accept threshold, sorting
+power — because two models with the same clean rate can need entirely
+different safety nets.  In the demo that is exactly what happens: the two
+models tie on the headline while differing sharply on how their errors
+would be caught.
 
 ## OCR noise vs LLM fabrication
 
@@ -350,6 +400,10 @@ Outputs written by a run:
 | `out/confidence_summary.csv` | ECE / Brier / AUROC per regime |
 | `out/confidence_per_field.csv` | calibration gap and AUROC per field (vs gold) |
 | `out/audit_estimates.csv` | audit-sample clean-rate estimates with Wilson CIs |
+| `out/ab/comparison.html` | the A/B comparison report (run_ab_demo.py) |
+| `out/ab/comparison_summary.csv` | per-model scorecard |
+| `out/ab/head_to_head.csv` | paired win/loss counts, difference range, luck probability |
+| `out/ab/per_field_comparison.csv` | mismatch rate per field per model, sorted by gap |
 
 Truth files written by the generator (read by humans and by run_demo's
 labelled diagnostics, never by the harness proper): `data/gold_truth.csv`,
@@ -406,4 +460,6 @@ scientist or searching the literature.
 | missed / spurious item | a filed item with no extracted partner / an extracted item with no filed partner |
 | straight-through | accepting a document without human review because its confidence scores clear a threshold |
 | escaped error | a bad document that a straight-through policy would have accepted |
+| head-to-head / paired comparison | scoring two models document by document over the same documents, so shared successes and failures cancel out |
+| chance it's luck | among documents where exactly one model was clean, how often a split this lopsided would occur between equally good models (the technical name is McNemar's / sign test p-value) |
 

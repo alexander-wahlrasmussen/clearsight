@@ -1,11 +1,14 @@
 import math
 
 import pandas as pd
+import pytest
 
 from uncertainty import (
     audit_sample_estimate,
     bootstrap_rate_ci,
     breakdown_clean_rate_cis,
+    chance_split_is_luck,
+    paired_bootstrap_diff_ci,
     wilson_interval,
 )
 
@@ -54,6 +57,50 @@ class TestBootstrapRateCi:
     def test_empty_is_nan(self):
         low, high = bootstrap_rate_ci([], seed=1)
         assert math.isnan(low) and math.isnan(high)
+
+
+class TestPairedBootstrapDiffCi:
+    def test_identical_models_differ_by_exactly_zero(self):
+        flags = [True] * 70 + [False] * 30
+        assert paired_bootstrap_diff_ci(flags, flags, seed=2) == (0.0, 0.0)
+
+    def test_interval_brackets_a_real_difference(self):
+        # A is clean on 30 documents where B is not; otherwise identical.
+        a = [True] * 80 + [False] * 20
+        b = [True] * 50 + [False] * 50
+        low, high = paired_bootstrap_diff_ci(a, b, seed=2)
+        assert low <= 0.30 <= high
+        assert low > 0.0  # the winner is clear, zero is outside the range
+
+    def test_deterministic_for_a_seed(self):
+        a = [True, False] * 50
+        b = [True] * 60 + [False] * 40
+        assert paired_bootstrap_diff_ci(a, b, seed=3) == paired_bootstrap_diff_ci(a, b, seed=3)
+
+    def test_mismatched_lengths_are_an_error_not_a_guess(self):
+        with pytest.raises(ValueError):
+            paired_bootstrap_diff_ci([True, False], [True], seed=1)
+
+    def test_empty_is_nan(self):
+        low, high = paired_bootstrap_diff_ci([], [], seed=1)
+        assert math.isnan(low) and math.isnan(high)
+
+
+class TestChanceSplitIsLuck:
+    def test_no_disagreements_prove_nothing(self):
+        assert chance_split_is_luck(0, 0) == 1.0
+
+    def test_known_binomial_values(self):
+        # 8 wins vs 2: two-sided exact = 2 * (C(10,0)+C(10,1)+C(10,2)) / 2^10
+        assert abs(chance_split_is_luck(8, 2) - 0.109375) < 1e-9
+        # a clean sweep of 10
+        assert abs(chance_split_is_luck(10, 0) - 2 / 1024) < 1e-9
+
+    def test_symmetric_in_the_models(self):
+        assert chance_split_is_luck(8, 2) == chance_split_is_luck(2, 8)
+
+    def test_even_split_is_pure_luck(self):
+        assert chance_split_is_luck(5, 5) == 1.0
 
 
 def gold_summary(n=100, n_clean=70) -> pd.DataFrame:

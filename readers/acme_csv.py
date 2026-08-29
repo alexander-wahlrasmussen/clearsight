@@ -37,13 +37,19 @@ _HEADER_CONFIDENCE_PREFIX = "hconf_"
 _ITEM_CONFIDENCE_PREFIX = "conf_"
 
 
-def read(path: str | Path) -> list[CanonicalRecord]:
+def read(path: str | Path, source_system: str = SOURCE_SYSTEM) -> list[CanonicalRecord]:
+    """`source_system` labels every record with the tool that produced the
+    file.  Override it when several models emit this same format (an A/B
+    test reads each model's file with its own label)."""
     # Group item rows per document, preserving file order.
     rows_by_doc: dict[str, list[dict]] = {}
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             rows_by_doc.setdefault(row["document_no"].strip(), []).append(row)
-    return [_to_canonical(doc_id, rows) for doc_id, rows in rows_by_doc.items()]
+    return [
+        _to_canonical(doc_id, rows, source_system)
+        for doc_id, rows in rows_by_doc.items()
+    ]
 
 
 def _confidences(row: dict, prefix: str) -> dict[str, float]:
@@ -74,13 +80,13 @@ def _to_item(row: dict) -> CanonicalItem:
     )
 
 
-def _to_canonical(doc_id: str, rows: list[dict]) -> CanonicalRecord:
+def _to_canonical(doc_id: str, rows: list[dict], source_system: str) -> CanonicalRecord:
     header = rows[0]
     return CanonicalRecord(
         shipment_id=text_or_none(header["shp_ref"]),
         doc_id=doc_id,
         country=text_or_none(header["decl_country"]),
-        source_system=SOURCE_SYSTEM,
+        source_system=source_system,
         declared_value=float_or_none(header["inv_total"]),
         currency=text_or_none(header["ccy"]),
         incoterm=text_or_none(header["terms"]),

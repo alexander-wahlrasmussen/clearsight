@@ -47,9 +47,11 @@ from ._common import datetime_or_none, float_or_none, int_or_none, text_or_none
 SOURCE_SYSTEM = "globex_capture"
 
 
-def read(path: str | Path) -> list[CanonicalRecord]:
+def read(path: str | Path, source_system: str = SOURCE_SYSTEM) -> list[CanonicalRecord]:
+    """`source_system` labels every record with the tool that produced the
+    file; override it when several models emit this same format."""
     root = ET.parse(path).getroot()
-    return [_to_canonical(doc) for doc in root.findall("Document")]
+    return [_to_canonical(doc, source_system) for doc in root.findall("Document")]
 
 
 def _confidences(parent: ET.Element | None) -> dict[str, float]:
@@ -84,7 +86,7 @@ def _to_item(item: ET.Element) -> CanonicalItem:
     )
 
 
-def _to_canonical(doc: ET.Element) -> CanonicalRecord:
+def _to_canonical(doc: ET.Element, source_system: str) -> CanonicalRecord:
     shipment = doc.find("Shipment")
     commercial = doc.find("Commercial")
     invoice = doc.find("Commercial/Invoice")
@@ -92,7 +94,7 @@ def _to_canonical(doc: ET.Element) -> CanonicalRecord:
         shipment_id=_attr(shipment, "ref"),
         doc_id=doc.get("id", "").strip(),
         country=_attr(shipment, "declarationCountry"),
-        source_system=SOURCE_SYSTEM,
+        source_system=source_system,
         declared_value=float_or_none(_attr(invoice, "total")),
         currency=_attr(invoice, "currency"),
         incoterm=_attr(commercial, "incoterm"),

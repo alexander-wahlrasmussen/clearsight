@@ -9,9 +9,10 @@ first — it explains the design decisions and has a plain-English glossary.
 
 ```bash
 pip install -r requirements.txt
-python run_demo.py --no-open   # generate data/ -> evaluate -> out/report.html
-pytest                         # unit + end-to-end smoke tests
-ruff check .                   # lint (no config; defaults)
+python run_demo.py --no-open      # generate data/ -> evaluate -> out/report.html
+python run_ab_demo.py --no-open   # two models, same docs -> out/ab/comparison.html
+pytest                            # unit + end-to-end smoke tests
+ruff check .                      # lint (no config; defaults)
 ```
 
 Python 3.10+.  Dependencies: pandas, PyYAML, pytest only — no ML
@@ -28,10 +29,14 @@ comparators.py         field comparators (versioned) -> match/mismatch/not_compa
 field_tiers.yaml       ALL criticality + comparator config; none in Python
 validity.py            rules needing no reference data ("blind" checks)
 evaluate.py            join, align, compare -> one row-level frame + aggregations
-uncertainty.py         bootstrap / Wilson ranges, audit-sample estimator
+uncertainty.py         bootstrap / Wilson ranges, audit-sample estimator,
+                       paired A/B statistics (diff range, luck probability)
 confidence_quality.py  ECE / Brier / AUROC on the confidence scores
+compare_models.py      paired A/B over the same documents; fairness-checked
 report.py              single self-contained HTML; every number drills to rows
+                       (build_report + build_comparison_report)
 run_demo.py            orchestrates everything, incl. synthetic-only diagnostics
+run_ab_demo.py         two model profiles over the same documents, head to head
 ```
 
 ## Rules that keep the design honest
