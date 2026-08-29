@@ -9,13 +9,16 @@ frameworks -- the file can be mailed around and opened anywhere.
 from __future__ import annotations
 
 import html
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
 from comparators import MISMATCH
-from evaluate import Evaluation
+from confidence_quality import ConfidenceQualitySummary
+from evaluate import Evaluation, LeadingIndicators
+from uncertainty import AuditEstimate
 
 DRILL_ROW_CAP = 100
 
@@ -31,6 +34,24 @@ STRUCTURE_COLUMNS = [
     "extracted_value", "filed_value", "reason", "country", "source_system",
 ]
 DOC_COLUMNS_BASE = ["doc_id", "country", "source_system"]
+
+
+@dataclass
+class ReportExtras:
+    """Optional analyses beyond the core proxy evaluation.  Every field may
+    be None; the corresponding report section simply does not render."""
+
+    gold_evaluation: Evaluation | None = None      # same extraction scored vs truth
+    false_alarms: pd.DataFrame | None = None       # mismatch vs filed, match vs gold
+    hidden_errors: pd.DataFrame | None = None      # match vs filed, mismatch vs gold
+    audit_estimates: list[AuditEstimate] = field(default_factory=list)
+    leading: LeadingIndicators | None = None       # blind signals vs proxy errors
+    confidence_summaries: list[ConfidenceQualitySummary] = field(default_factory=list)
+    per_field_confidence: pd.DataFrame | None = None
+    clean_rate_ci: tuple[float, float] | None = None       # proxy, bootstrap
+    gold_clean_rate_ci: tuple[float, float] | None = None  # gold, bootstrap
+    breakdown_ci: pd.DataFrame | None = None       # Wilson CI per country x system
+    extra_notes: list[str] = field(default_factory=list)
 
 
 def esc(value) -> str:
@@ -50,6 +71,13 @@ def _pct(value) -> str:
     if value is None or pd.isna(value):
         return "&ndash;"
     return f"{value * 100:.1f}%"
+
+
+def _pct_with_ci(value, ci: tuple[float, float] | None) -> str:
+    text = _pct(value)
+    if ci is not None:
+        text += f' <span class="ci">[{ci[0] * 100:.1f}&ndash;{ci[1] * 100:.1f}]</span>'
+    return text
 
 
 class _Drilldowns:
@@ -117,7 +145,7 @@ def _raw_table(header_cells: list[str], body_rows: list[list[str]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _headline(ev: Evaluation, dd: _Drilldowns) -> str:
+def _headline(ev: Evaluation, dd: _Drilldowns, extras: ReportExtras) -> str:
     comparisons = ev.comparisons
     tier = ev.critical_tier
     dirty_docs = ev.doc_summary[~ev.doc_summary["clean"]]
@@ -127,15 +155,22 @@ def _headline(ev: Evaluation, dd: _Drilldowns) -> str:
     critical_mismatch_rows = comparisons[
         (comparisons["status"] == MISMATCH) & (comparisons["tier"] == tier)
     ]
+    clean_sub = dd.link(
+        f"{len(dirty_docs)} documents are not clean",
+        f"Documents with at least one tier-{tier} mismatch",
+        dirty_docs, doc_cols,
+    )
+    if extras.clean_rate_ci is not None:
+        low, high = extras.clean_rate_ci
+        clean_sub += (
+            f' &middot; <span class="ci">95% CI {low * 100:.1f}&ndash;{high * 100:.1f}'
+            " (bootstrap)</span>"
+        )
     tiles = [
         (
             f"{ev.clean_document_rate * 100:.1f}%",
-            f"clean document rate (zero tier-{tier} mismatches)",
-            dd.link(
-                f"{len(dirty_docs)} documents are not clean",
-                f"Documents with at least one tier-{tier} mismatch",
-                dirty_docs, doc_cols,
-            ),
+            f"clean document rate (zero tier-{tier} mismatches, vs filed)",
+            clean_sub,
         ),
         (
             f"{len(critical_mismatch_rows):,}",
@@ -174,6 +209,226 @@ def _join_note(ev: Evaluation, dd: _Drilldowns) -> str:
             f"{len(frame)} filed but never extracted", "Filed but never extracted", frame
         ))
     return " &middot; ".join(parts)
+
+
+def _escaped_rate_at(evaluation: Evaluation, threshold: float) -> float:
+    st = evaluation.straight_through
+    row = st[(st["threshold"] - threshold).abs() < 1e-9]
+    return float(row["escaped_error_rate"].iloc[0]) if len(row) else float("nan")
+
+
+def _regimes_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> str:
+    gold = extras.gold_evaluation
+    if gold is None:
+        return ""
+    tier = ev.critical_tier
+
+    def critical_mismatches(evaluation: Evaluation) -> int:
+        c = evaluation.comparisons
+        return int(((c["status"] == MISMATCH) & (c["tier"] == tier)).sum())
+
+    gold_n, proxy_n = critical_mismatches(gold), critical_mismatches(ev)
+    gold_escape, proxy_escape = _escaped_rate_at(gold, 0.80), _escaped_rate_at(ev, 0.80)
+    body = [
+        [
+            "clean document rate",
+            _pct_with_ci(gold.clean_document_rate, extras.gold_clean_rate_ci),
+            _pct_with_ci(ev.clean_document_rate, extras.clean_rate_ci),
+            f"{(ev.clean_document_rate - gold.clean_document_rate) * 100:+.1f} pp",
+        ],
+        [
+            f"tier-{tier} mismatch rows (fields + structure)",
+            f"{gold_n:,}", f"{proxy_n:,}", f"{proxy_n - gold_n:+,}",
+        ],
+        [
+            "straight-through @ 0.80: escaped error rate",
+            _pct(gold_escape), _pct(proxy_escape),
+            f"{(proxy_escape - gold_escape) * 100:+.1f} pp",
+        ],
+    ]
+    table = _raw_table(
+        ["metric", "vs gold (truth)", "vs filed (proxy)", "proxy bias"], body
+    )
+
+    disagreement = ""
+    if extras.false_alarms is not None and extras.hidden_errors is not None:
+        false_alarms = extras.false_alarms
+        hidden = extras.hidden_errors
+        fa_critical = int((false_alarms["tier"] == tier).sum())
+        disagreement_cols = [
+            "doc_id", "level", "field", "item_no_extracted", "tier",
+            "extracted_value", "filed_value", "gold_value", "reason", "confidence",
+        ]
+        fa_link = dd.link(
+            f"{len(false_alarms):,} false alarms ({fa_critical} tier-{tier})",
+            "Proxy false alarms: mismatch vs filed, match vs gold",
+            false_alarms, disagreement_cols,
+        )
+        hidden_link = dd.link(
+            f"{len(hidden):,} hidden errors",
+            "Hidden errors: match vs filed, mismatch vs gold",
+            hidden, disagreement_cols,
+        )
+        disagreement = (
+            f"<p>Splitting the proxy's field verdicts by what gold says: {fa_link} "
+            "&mdash; the proxy's noise, overwhelmingly post-filing amendments &mdash; "
+            f"and {hidden_link}, where extraction and filing were wrong the same way. "
+            "The hidden-error count is near zero here because filings are still "
+            "independent of extraction; it is the number that silently grows once "
+            "auto-accepted extractions start being filed verbatim.</p>"
+        )
+
+    audit = ""
+    if extras.audit_estimates:
+        audit_body = []
+        gold_docs = gold.doc_summary
+        for estimate in extras.audit_estimates:
+            sampled = gold_docs[gold_docs["doc_id"].isin(estimate.sampled_doc_ids)]
+            audit_body.append([
+                dd.link(f"{estimate.sample_size:,}",
+                        f"Audit sample of {estimate.sample_size} documents (graded vs gold)",
+                        sampled, DOC_COLUMNS_BASE + ["critical_mismatches", "clean"]),
+                f"{estimate.clean_in_sample:,}",
+                _pct(estimate.estimate),
+                f"{estimate.ci_low * 100:.1f}&ndash;{estimate.ci_high * 100:.1f}%",
+                f"{estimate.ci_width * 100:.1f} pp",
+            ])
+        audit_table = _raw_table(
+            ["documents audited", "clean in sample", "estimated true clean rate",
+             "95% CI (Wilson)", "CI width"],
+            audit_body,
+        )
+        audit = (
+            "<h3>The production substitute for gold: a graded audit sample</h3>"
+            "<p>In production nobody has truth for the whole population; you buy it "
+            "for a random sample and let the interval speak.  Here the &ldquo;human "
+            f"grading&rdquo; is played by the gold file.  The full-population truth is "
+            f"{_pct(gold.clean_document_rate)}; each interval below should usually "
+            "cover it &mdash; and a 95% interval still misses one run in twenty, "
+            "which is part of what it teaches.  The CI width column is the price "
+            "list for annotation: precision scales with the square root of the "
+            "sample.</p>"
+            f"{audit_table}"
+        )
+
+    return (
+        "<section><h2>Three ways to score the same extraction</h2>"
+        "<p><strong>Truth</strong> (gold): only exists here because the data is "
+        "synthetic; in production it is a human-graded audit sample.  "
+        "<strong>Proxy</strong> (the filed record): available for every document, "
+        "but days late and noisy &mdash; amendments count as errors, and "
+        "agreement can hide shared mistakes.  <strong>Blind</strong> (validity "
+        "rules + confidence): available instantly with no reference at all; its "
+        "reach is measured in the leading-indicators section below.  The rest of "
+        "this report scores against the proxy, because that is what production "
+        "sees.</p>"
+        f"{table}{disagreement}{audit}</section>"
+    )
+
+
+def _leading_indicators_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> str:
+    leading = extras.leading
+    if leading is None:
+        return ""
+    doc_cols = DOC_COLUMNS_BASE + [
+        "critical_mismatches", "min_critical_confidence", "missed_items", "spurious_items",
+    ]
+    body = []
+    for _, row in leading.frame.iterrows():
+        signal = row["signal"]
+        selected = ev.doc_summary[leading.masks[signal]]
+        body.append([
+            esc(signal),
+            dd.link(f"{int(row['documents']):,}", f"Documents: {signal}",
+                    selected, doc_cols),
+            f"{int(row['docs_with_critical_mismatch']):,}",
+            _pct(row["critical_mismatch_rate"]),
+            "&ndash;" if pd.isna(row["lift_vs_base"]) else f"{row['lift_vs_base']:.1f}x",
+        ])
+    table = _raw_table(
+        ["blind signal (known before filing)", "documents", "with tier-1 mismatch",
+         "mismatch rate", "lift vs base"],
+        body,
+    )
+    return (
+        "<section><h2>Blind-regime leading indicators</h2>"
+        "<p>In production the proxy arrives days after extraction.  Until then the "
+        "only per-document signals are the validity rules and the confidence "
+        "scores &mdash; so the operational question is how much of the eventual "
+        "damage those signals point at.  The last row is the residual: documents "
+        "that look perfectly clean ex ante and are wrong anyway.  Fabricated "
+        "values &mdash; valid-looking, high-confidence, wrong &mdash; live "
+        "almost entirely in that row.</p>"
+        f"{table}</section>"
+    )
+
+
+def _confidence_quality_section(extras: ReportExtras, dd: _Drilldowns) -> str:
+    if not extras.confidence_summaries:
+        return ""
+    body = [
+        [
+            esc(s.label), f"{s.n_scored:,}", _pct(s.accuracy), _fmt(s.mean_confidence),
+            _fmt(s.ece), _fmt(s.brier), _fmt(s.auroc),
+        ]
+        for s in extras.confidence_summaries
+    ]
+    summary_table = _raw_table(
+        ["scored against", "fields scored", "accuracy", "mean confidence",
+         "ECE", "Brier", "AUROC"],
+        body,
+    )
+    per_field = ""
+    if extras.per_field_confidence is not None and extras.gold_evaluation is not None:
+        gold_comparisons = extras.gold_evaluation.comparisons
+        field_body = []
+        for _, row in extras.per_field_confidence.iterrows():
+            field_name = row["field"]
+            mismatches = gold_comparisons[
+                (gold_comparisons["field"] == field_name)
+                & (gold_comparisons["status"] == MISMATCH)
+                & gold_comparisons["confidence"].notna()
+            ].sort_values("confidence", ascending=False)
+            field_body.append([
+                esc(field_name),
+                esc(row["level"]),
+                dd.link(f"{int(row['n_scored']):,}",
+                        f"True errors on {field_name}, most confident first (vs gold)",
+                        mismatches, COMPARISON_COLUMNS),
+                _pct(row["accuracy"]),
+                _fmt(row["mean_confidence"]),
+                f"{row['calibration_gap'] * 100:+.1f} pp",
+                _fmt(row["auroc"]),
+            ])
+        per_field = (
+            "<h3>Per field (vs gold)</h3>"
+            "<p>A pooled score hides that 0.9 on an HS code and 0.9 on a date can "
+            "mean different things.  Positive gap = overconfident.  Click a count "
+            "for that field's true errors, most confident first.</p>"
+            + _raw_table(
+                ["field", "level", "fields scored", "accuracy", "mean confidence",
+                 "calibration gap", "AUROC"],
+                field_body,
+            )
+        )
+    return (
+        "<section><h2>Is the confidence score any good?</h2>"
+        "<p>Two different properties.  <strong>Calibration</strong> (ECE, Brier: "
+        "lower is better): does 0.9 mean 90%?  Fixable after the fact by "
+        "recalibration.  <strong>Discrimination</strong> (AUROC: 1.0 separates "
+        "right from wrong perfectly, 0.5 is noise): do errors rank below correct "
+        "fields at all?  Not fixable by any recalibration &mdash; and the "
+        "auto-accept gate only uses the ranking, so AUROC decides whether a "
+        "confidence gate can work.  Comparing the two rows shows label noise at "
+        "work: against the noisy proxy the same score's discrimination always "
+        "reads lower (AUROC, Brier), while apparent calibration can drift either "
+        "way &mdash; here the noise nudges an underconfident score's ECE slightly "
+        "down, flattering it.  Fabricated errors carry deliberately high "
+        "confidence, which is what keeps AUROC away from 1.0 &mdash; and the "
+        "fields fabrication targets are exactly the ones with the worst AUROC "
+        "below.</p>"
+        f"{summary_table}{per_field}</section>"
+    )
 
 
 def _alignment_section(ev: Evaluation, dd: _Drilldowns) -> str:
@@ -354,9 +609,17 @@ def _per_field_section(ev: Evaluation, dd: _Drilldowns) -> str:
     )
 
 
-def _breakdown_section(ev: Evaluation, dd: _Drilldowns) -> str:
+def _breakdown_section(
+    ev: Evaluation, dd: _Drilldowns, breakdown_ci: pd.DataFrame | None = None
+) -> str:
     comparisons = ev.comparisons
     tier = ev.critical_tier
+    ci_lookup: dict[tuple, tuple[float, float]] = {}
+    if breakdown_ci is not None:
+        ci_lookup = {
+            (row["country"], row["source_system"]): (row["clean_ci_low"], row["clean_ci_high"])
+            for _, row in breakdown_ci.iterrows()
+        }
     body = []
     for _, row in ev.breakdown.iterrows():
         country, system = row["country"], row["source_system"]
@@ -370,7 +633,7 @@ def _breakdown_section(ev: Evaluation, dd: _Drilldowns) -> str:
             esc(country),
             esc(system),
             f"{int(row['documents']):,}",
-            _pct(row["clean_document_rate"]),
+            _pct_with_ci(row["clean_document_rate"], ci_lookup.get((country, system))),
             dd.link(f"{int(row['critical_mismatches']):,}",
                     f"Tier-{tier} mismatches: {country} / {system}",
                     critical_rows, COMPARISON_COLUMNS),
@@ -380,7 +643,7 @@ def _breakdown_section(ev: Evaluation, dd: _Drilldowns) -> str:
                     cell_rows, COMPARISON_COLUMNS),
         ])
     table = _raw_table(
-        ["country", "source system", "documents", "clean doc rate",
+        ["country", "source system", "documents", "clean doc rate [95% CI]",
          f"tier-{tier} mismatches", f"tier-{tier} mismatch rate", "all mismatches"],
         body,
     )
@@ -389,7 +652,9 @@ def _breakdown_section(ev: Evaluation, dd: _Drilldowns) -> str:
         "<p>Country is the country of filing (taken from the filed record); "
         "source system is the extraction tool that produced the record.  A "
         "single bad cell here usually means bad scans or a bad template for "
-        "that lane, not a globally bad tool.</p>"
+        "that lane, not a globally bad tool.  The intervals (Wilson, 95%) are "
+        "there to stop over-reading small slices: a two-point difference "
+        "between cells whose intervals overlap is not a finding.</p>"
         f"{table}</section>"
     )
 
@@ -435,8 +700,22 @@ def _validity_section(validity: pd.DataFrame | None, dd: _Drilldowns) -> str:
     )
 
 
-def _caveats_section(extra_notes: list[str] | None) -> str:
+def _caveats_section(extra_notes: list[str] | None, has_gold: bool = False) -> str:
     notes = [
+        "Fabricated errors &mdash; a different but valid EORI, an in-tariff HS "
+        "sibling, a wrong-but-real origin &mdash; pass every validity rule and "
+        "carry high confidence.  This is the characteristic LLM failure mode "
+        "(fluent garbage), as opposed to OCR noise (visible garbage), and it is "
+        "why blind monitoring alone cannot carry production.",
+    ]
+    if has_gold:
+        notes.append(
+            "The gold columns exist only because this data is synthetic.  In "
+            "production the gold regime is a periodically drawn, human-graded "
+            "audit sample &mdash; see the audit table above for what its "
+            "precision costs."
+        )
+    notes += [
         "The filed record is <strong>not ground truth</strong>.  Documents get "
         "legitimately amended after filing (revaluations, corrected counts, "
         "reclassifications), and those amendments appear here as extraction "
@@ -500,6 +779,7 @@ a.drill { color: var(--accent); text-decoration: underline dotted; cursor: point
 .drill-head button { border: 1px solid var(--line); background: #fff; border-radius: 6px;
                      padding: .2rem .8rem; cursor: pointer; }
 .note { font-size: .85rem; }
+.ci { color: var(--muted); font-size: .85em; white-space: nowrap; }
 .caveats { border-left: 4px solid #b45309; }
 .caveats li { margin: .4rem 0; max-width: 85ch; }
 #drilldowns h2 { margin-top: 2rem; }
@@ -528,21 +808,25 @@ def build_report(
     evaluation: Evaluation,
     validity_results: pd.DataFrame | None,
     out_path: str | Path,
-    extra_notes: list[str] | None = None,
+    extras: ReportExtras | None = None,
     generated_at: datetime | None = None,
 ) -> Path:
+    extras = extras or ReportExtras()
     dd = _Drilldowns()
     generated_at = generated_at or datetime.now()
     sections = [
-        _headline(evaluation, dd),
+        _headline(evaluation, dd, extras),
+        _regimes_section(evaluation, extras, dd),
         _alignment_section(evaluation, dd),
         _straight_through_section(evaluation, dd),
+        _leading_indicators_section(evaluation, extras, dd),
         _calibration_section(evaluation, dd),
+        _confidence_quality_section(extras, dd),
         _per_field_section(evaluation, dd),
-        _breakdown_section(evaluation, dd),
+        _breakdown_section(evaluation, dd, extras.breakdown_ci),
         _worst_mismatches_section(evaluation),
         _validity_section(validity_results, dd),
-        _caveats_section(extra_notes),
+        _caveats_section(extras.extra_notes, has_gold=extras.gold_evaluation is not None),
     ]
     page = f"""<!DOCTYPE html>
 <html lang="en">

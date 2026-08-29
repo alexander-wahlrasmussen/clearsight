@@ -16,7 +16,9 @@ the same HS chapter (that is what real invoices look like, and it is what
 makes item alignment genuinely hard).  NL documents are systematically
 ~2.5x worse -- a worse scan lane, nothing about the country itself.
 
-Injected FIELD error patterns:
+Errors come in three styles, and the style column in the sidecar matters:
+
+  NOISE (the OCR-era failure mode) -- detectable-ish garbage:
   - OCR digit confusion in the invoice total, item values, weights, EORI
     and BL reference
   - HS codes truncated to 6 digits or with one misread digit
@@ -25,19 +27,42 @@ Injected FIELD error patterns:
   - incoterm and currency confusion
   - net weight exceeding gross (caught by validity, no ground truth needed)
 
-Injected STRUCTURAL error patterns (the reason this harness is multi-item):
+  FABRICATION (the LLM-era failure mode) -- fluent garbage that passes
+  every validity rule by construction, delivered with HIGH confidence:
+  - a different but perfectly valid EORI (right country, right length,
+    correct check digit)
+  - a different but in-tariff HS code from the same chapter (right format,
+    in the tariff list, same supplementary unit)
+  - a different but real origin country
+  No blind signal exists for these; only the proxy or an audited gold
+  sample can find them.
+
+  STRUCTURAL (the reason this harness is multi-item):
   - a dropped goods item (the last line falls off a page break)
   - two same-chapter items merged into one (values/quantities summed)
   - a spurious item: the invoice's subtotal line read as goods
+  A drop or a spurious line breaks the items-sum-to-total arithmetic, so
+  validity can catch it before filing; a merge preserves the sum and
+  cannot be caught that way -- deliberately.
 
-A drop or a spurious line breaks the items-sum-to-total arithmetic, so
-validity can catch it before filing; a merge preserves the sum and cannot
-be caught that way -- deliberately.
+Truth written to disk (the harness proper never reads any of it):
+  gold_truth.csv            the true records, in the ledger export schema
+                            -- what a perfect extraction would produce.
+                            Only exists because this data is synthetic; in
+                            production its stand-in is a human-graded
+                            audit sample.
+  injected_errors_truth.csv every injected error with its kind and style,
+                            so a human (or run_demo's synthetic-only
+                            diagnostic) can check which styles the blind
+                            signals actually catch.
+  amendments_truth.csv      legitimate post-filing changes on the FILED
+                            side -- mismatches that are not extraction
+                            errors.
 
-Confidence scores are generated to be *imperfectly* honest: corrupted
-fields tend to get lower confidence, but the distributions overlap, so the
-calibration table has something real to show.  Dropped items produce no
-low score anywhere -- a confidence gate cannot see what is not there.
+Confidence scores are generated to be *imperfectly* honest: noise-corrupted
+fields tend to get lower confidence, fabricated fields get high confidence
+(fluent garbage reads as confident), and dropped items produce no low
+score anywhere -- a confidence gate cannot see what is not there.
 """
 
 from __future__ import annotations
@@ -110,12 +135,21 @@ RATES = {
     "weight_ocr": 0.025,
     "net_exceeds_gross": 0.012,
     "package_off_by_one": 0.015,
+    # fabrication (LLM-style): plausible, valid, wrong, confident
+    "eori_fabricated": 0.01,      # per document
+    "hs_fabricated": 0.015,       # per item (same-chapter sibling)
+    "origin_fabricated": 0.015,   # per item (different real country)
     # structural, per document
     "drop_item": 0.025,       # last line falls off a page break (needs >= 2 items)
     "merge_items": 0.02,      # two same-chapter lines read as one (needs candidates)
     "spurious_item": 0.012,   # subtotal line read as a goods item
 }
 AMENDMENT_RATE = 0.05         # per document; NOT an extraction error
+
+# Error styles recorded in the injected-errors sidecar.
+NOISE = "noise"               # OCR-era: garbage that often looks like garbage
+FABRICATION = "fabrication"   # LLM-era: valid-looking, high-confidence, wrong
+STRUCTURAL = "structural"     # whole goods items dropped / merged / invented
 
 OCR_DIGIT_CONFUSION = {"0": "8", "1": "7", "2": "7", "3": "8", "4": "9",
                        "5": "6", "6": "5", "7": "1", "8": "3", "9": "4"}
@@ -302,9 +336,10 @@ class ExtractedItem:
 
 def _corrupt_item(
     item: TrueItem, rng, hit
-) -> tuple[ExtractedItem, set[str]]:
+) -> tuple[ExtractedItem, list[dict]]:
     """Field-level corruption of one goods item.  Returns the extracted
-    item (confidence filled in later) and the set of corrupted fields."""
+    item (confidence filled in later) and a list of injected errors, each
+    {field, kind, style}."""
     values = {
         "hs_code": item.hs_code,
         "origin_country": item.origin_country,
@@ -315,42 +350,57 @@ def _corrupt_item(
         "net_weight": item.net_weight,
         "package_count": item.package_count,
     }
-    corrupted: set[str] = set()
+    errors: list[dict] = []
+
+    def log(field: str, kind: str, style: str) -> None:
+        errors.append({"field": field, "kind": kind, "style": style})
 
     if hit("item_value_ocr"):
         values["item_value"] = float(_confuse_digit(f"{item.item_value:.2f}", rng))
-        corrupted.add("item_value")
-    if hit("hs_truncate"):
+        log("item_value", "ocr_digit", NOISE)
+    # HS: fabrication first (a plausible same-chapter sibling that passes
+    # every validity rule), else the OCR-era noise variants.
+    hs_siblings = [c for c in _POOL_BY_CHAPTER[item.hs_code[:2]] if c != item.hs_code]
+    if hs_siblings and hit("hs_fabricated"):
+        values["hs_code"] = rng.choice(hs_siblings)
+        log("hs_code", "fabricated_code", FABRICATION)
+    elif hit("hs_truncate"):
         values["hs_code"] = item.hs_code[:6]
-        corrupted.add("hs_code")
+        log("hs_code", "truncated_code", NOISE)
     elif hit("hs_digit"):
         values["hs_code"] = _confuse_digit(item.hs_code, rng)
-        corrupted.add("hs_code")
-    if hit("origin_missing"):
+        log("hs_code", "ocr_digit", NOISE)
+    # Origin: a confidently wrong real country, or simply missing.
+    if hit("origin_fabricated"):
+        values["origin_country"] = rng.choice(
+            [c for c in ORIGIN_COUNTRIES if c != item.origin_country]
+        )
+        log("origin_country", "fabricated_value", FABRICATION)
+    elif hit("origin_missing"):
         values["origin_country"] = None
-        corrupted.add("origin_country")
+        log("origin_country", "missing", NOISE)
     if hit("quantity_slip"):
         values["quantity"] = rng.choice(
             [item.quantity * 10, max(1.0, item.quantity // 10), item.quantity + 1]
         )
-        corrupted.add("quantity")
+        log("quantity", "quantity_slip", NOISE)
     if hit("unit_wrong"):
         values["quantity_unit"] = rng.choice(
             sorted(VALID_QUANTITY_UNITS - {item.quantity_unit})
         )
-        corrupted.add("quantity_unit")
+        log("quantity_unit", "unit_confusion", NOISE)
     if hit("weight_ocr"):
         which = rng.choice(["gross_weight", "net_weight"])
         values[which] = float(_confuse_digit(f"{values[which]:.1f}", rng))
-        corrupted.add(which)
+        log(which, "ocr_digit", NOISE)
     if hit("net_exceeds_gross"):
         values["net_weight"] = round(item.gross_weight * rng.uniform(1.02, 1.15), 1)
-        corrupted.add("net_weight")
+        log("net_weight", "net_gross_inversion", NOISE)
     if hit("package_off_by_one"):
         values["package_count"] = max(1, item.package_count + rng.choice([-1, 1]))
-        corrupted.add("package_count")
+        log("package_count", "count_slip", NOISE)
 
-    return ExtractedItem(item_number=item.item_number, confidence={}, **values), corrupted
+    return ExtractedItem(item_number=item.item_number, confidence={}, **values), errors
 
 
 def _merge_candidates(items: list[ExtractedItem]) -> list[int]:
@@ -362,26 +412,50 @@ def _merge_candidates(items: list[ExtractedItem]) -> list[int]:
     ]
 
 
+def _describe_true_item(item: TrueItem) -> str:
+    return f"HS {item.hs_code}, {item.quantity:g} {item.quantity_unit}, value {item.item_value:,.2f}"
+
+
 def _corrupt_for_extraction(
     doc: TrueDoc, rng: random.Random
-) -> tuple[dict, dict[str, float], list[ExtractedItem]]:
-    """Return (extracted header, header confidence, extracted items)."""
+) -> tuple[dict, dict[str, float], list[ExtractedItem], list[dict]]:
+    """Return (extracted header, header confidence, extracted items,
+    injected error rows for the truth sidecar)."""
     multiplier = BAD_COUNTRY_MULTIPLIER if doc.country == BAD_COUNTRY else 1.0
 
     def hit(rate_name: str) -> bool:
         return rng.random() < min(RATES[rate_name] * multiplier, 0.95)
 
+    error_rows: list[dict] = []
+
+    def log_error(item_number, field, kind, style, true_value, extracted_value) -> None:
+        error_rows.append(
+            {
+                "doc_id": doc.doc_id,
+                "item_number": item_number,
+                "field": field,
+                "kind": kind,
+                "style": style,
+                "value_on_document": true_value,
+                "extracted_value": extracted_value,
+            }
+        )
+
     # --- items: field corruption first, then structure -------------------
     items: list[ExtractedItem] = []
-    corrupted_by_item: list[set[str]] = []
+    true_by_position: list[TrueItem] = list(doc.items)
+    errors_by_item: list[list[dict]] = []
     for item in doc.items:
-        extracted, corrupted = _corrupt_item(item, rng, hit)
+        extracted, errors = _corrupt_item(item, rng, hit)
         items.append(extracted)
-        corrupted_by_item.append(corrupted)
+        errors_by_item.append(errors)
 
     if len(items) >= 2 and hit("drop_item"):
+        dropped = true_by_position.pop()
         items.pop()          # the last line fell off a page break
-        corrupted_by_item.pop()
+        errors_by_item.pop()  # its field-level errors vanished with it
+        log_error(dropped.item_number, "(whole item)", "dropped_item", STRUCTURAL,
+                  _describe_true_item(dropped), "")
 
     candidates = _merge_candidates(items)
     if candidates and hit("merge_items"):
@@ -395,12 +469,16 @@ def _corrupt_for_extraction(
             net_weight=round(first.net_weight + second.net_weight, 1),
             package_count=first.package_count + second.package_count,
         )
+        absorbed = true_by_position.pop(i + 1)
         items.pop(i + 1)
-        corrupted_by_item[i] = corrupted_by_item[i] | {
-            "quantity", "item_value", "gross_weight", "net_weight", "package_count"
-        }
-        corrupted_by_item.pop(i + 1)
+        errors_by_item.pop(i + 1)  # the absorbed line's own errors vanished
+        for field in ("quantity", "item_value", "gross_weight", "net_weight", "package_count"):
+            errors_by_item[i].append({"field": field, "kind": "merged_items", "style": STRUCTURAL})
+        log_error(absorbed.item_number, "(whole item)", "merged_items", STRUCTURAL,
+                  _describe_true_item(absorbed),
+                  f"(absorbed into extracted line {i + 1})")
 
+    spurious_index: int | None = None
     if hit("spurious_item"):
         # The invoice's subtotal line, read as one more goods item.
         template = items[-1]
@@ -415,18 +493,37 @@ def _corrupt_for_extraction(
                 confidence={},  # replace() would otherwise share template's dict
             )
         )
-        corrupted_by_item.append(set(ITEM_CONFIDENCE_FIELDS))
+        errors_by_item.append([
+            {"field": field, "kind": "spurious_item", "style": STRUCTURAL}
+            for field in ITEM_CONFIDENCE_FIELDS
+        ])
+        spurious_index = len(items) - 1
 
     # Renumber as the extraction tool would: in the order it saw them.
     for position, item in enumerate(items, start=1):
         item.item_number = position
+    if spurious_index is not None:
+        spurious = items[spurious_index]
+        log_error(spurious.item_number, "(whole item)", "spurious_item", STRUCTURAL,
+                  "", f"subtotal read as goods: {spurious.hs_code}, value {spurious.item_value:,.2f}")
 
-    # --- item confidence --------------------------------------------------
-    for item, corrupted in zip(items, corrupted_by_item):
+    # --- item confidence + sidecar rows for surviving field errors -------
+    # (the spurious item, if any, sits past the end of true_by_position:
+    # it has no true counterpart to log against, only confidence to score)
+    for index, (item, errors) in enumerate(zip(items, errors_by_item)):
+        styles = {error["field"]: error["style"] for error in errors}
         for field in ITEM_CONFIDENCE_FIELDS:
             if getattr(item, field) is None:
                 continue  # nothing extracted, no score reported
-            item.confidence[field] = _confidence_score(field in corrupted, rng)
+            item.confidence[field] = _confidence_score(styles.get(field), rng)
+        if index >= len(true_by_position):
+            continue  # spurious: already logged as one whole-item event
+        true_item = true_by_position[index]
+        for error in errors:
+            if error["kind"] in ("merged_items", "spurious_item"):
+                continue  # already logged as one whole-item event
+            log_error(item.item_number, error["field"], error["kind"], error["style"],
+                      getattr(true_item, error["field"]), getattr(item, error["field"]))
 
     # --- header -----------------------------------------------------------
     header = {
@@ -436,41 +533,68 @@ def _corrupt_for_extraction(
         "importer_eori": doc.importer_eori,
         "bl_reference": doc.bl_reference,
     }
-    corrupted_header: set[str] = set()
+    header_errors: list[dict] = []
+
+    def log_header(field: str, kind: str, style: str) -> None:
+        header_errors.append({"field": field, "kind": kind, "style": style})
+
     if hit("total_ocr"):
         header["declared_value"] = float(_confuse_digit(f"{doc.invoice_total:.2f}", rng))
-        corrupted_header.add("declared_value")
+        log_header("declared_value", "ocr_digit", NOISE)
     if hit("currency_wrong"):
         header["currency"] = CURRENCY_CONFUSION[doc.currency]
-        corrupted_header.add("currency")
-    if hit("eori_digit"):
+        log_header("currency", "code_confusion", NOISE)
+    if hit("eori_fabricated"):
+        # A perfectly valid, entirely wrong EORI: right country, right
+        # length, correct check digit.  No blind signal exists for this.
+        header["importer_eori"] = _make_eori(rng, doc.importer_eori[:2])
+        log_header("importer_eori", "fabricated_value", FABRICATION)
+    elif hit("eori_digit"):
         header["importer_eori"] = doc.importer_eori[:2] + _confuse_digit(
             doc.importer_eori[2:], rng
         )
-        corrupted_header.add("importer_eori")
+        log_header("importer_eori", "ocr_digit", NOISE)
     if hit("bl_ocr"):
         header["bl_reference"] = _confuse_bl_chars(doc.bl_reference, rng)
-        corrupted_header.add("bl_reference")
+        log_header("bl_reference", "ocr_characters", NOISE)
     if hit("incoterm_confusion"):
         header["incoterm"] = INCOTERM_CONFUSION[doc.incoterm]
-        corrupted_header.add("incoterm")
+        log_header("incoterm", "code_confusion", NOISE)
 
     extracted_date = doc.invoice_date
     d = doc.invoice_date
     if d.day <= 12 and d.day != d.month and hit("date_swap"):
         extracted_date = date(d.year, d.day, d.month)
-        corrupted_header.add("invoice_date")
+        log_header("invoice_date", "day_month_swap", NOISE)
     header["invoice_date"] = _format_extracted_date(extracted_date, doc.source_system, rng)
 
+    header_styles = {error["field"]: error["style"] for error in header_errors}
     header_confidence = {
-        field: _confidence_score(field in corrupted_header, rng)
+        field: _confidence_score(header_styles.get(field), rng)
         for field in HEADER_CONFIDENCE_FIELDS
     }
-    return header, header_confidence, items
+    true_header = {
+        "declared_value": doc.invoice_total, "currency": doc.currency,
+        "incoterm": doc.incoterm, "importer_eori": doc.importer_eori,
+        "bl_reference": doc.bl_reference, "invoice_date": doc.invoice_date.isoformat(),
+    }
+    for error in header_errors:
+        log_error(None, error["field"], error["kind"], error["style"],
+                  true_header[error["field"]], header[error["field"]])
+
+    return header, header_confidence, items, error_rows
 
 
-def _confidence_score(was_corrupted: bool, rng: random.Random) -> float:
-    if was_corrupted:
+def _confidence_score(error_style: str | None, rng: random.Random) -> float:
+    """Confidence for one extracted field, given how it was corrupted.
+
+    Fabricated values score HIGH -- fluent garbage reads as confident,
+    which is exactly why LLM-era errors slip through confidence gates.
+    Noise and structural corruption score lower but overlapping the
+    correct range, so calibration is imperfect rather than cartoonish."""
+    if error_style == FABRICATION:
+        return round(rng.uniform(0.75, 0.97), 3)
+    if error_style is not None:
         return round(rng.uniform(0.45, 0.93), 3)
     if rng.random() < 0.05:
         return round(rng.uniform(0.55, 0.82), 3)  # correct but unsure
@@ -711,6 +835,17 @@ def _write_amendments_csv(rows: list[dict], path: Path) -> None:
         writer.writerows(rows)
 
 
+def _write_injected_errors_csv(rows: list[dict], path: Path) -> None:
+    columns = [
+        "doc_id", "item_number", "field", "kind", "style",
+        "value_on_document", "extracted_value",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
@@ -725,15 +860,21 @@ def generate(n_docs: int = 3000, seed: int = 42, data_dir: str | Path = "data") 
     acme_entries = []
     globex_entries = []
     filed_entries = []
+    gold_entries = []
     amendment_rows: list[dict] = []
+    injected_error_rows: list[dict] = []
     n_items_total = 0
 
     for i in range(n_docs):
         doc = _make_true_doc(i, rng)
         n_items_total += len(doc.items)
-        header, header_conf, items = _corrupt_for_extraction(doc, rng)
+        header, header_conf, items, error_rows = _corrupt_for_extraction(doc, rng)
+        injected_error_rows.extend(error_rows)
         filed_items, filed_total, amendments = _file_with_possible_amendment(doc, rng)
         filed_entries.append((doc, filed_items, filed_total))
+        # Gold: the truth, in the same ledger export schema, so the same
+        # reader loads it and evaluate() can score against it unchanged.
+        gold_entries.append((doc, doc.items, doc.invoice_total))
         amendment_rows.extend(amendments)
         entry = (doc, header, header_conf, items)
         if doc.source_system == ACME:
@@ -745,15 +886,20 @@ def generate(n_docs: int = 3000, seed: int = 42, data_dir: str | Path = "data") 
         "acme_csv": data_dir / "extracted_acme.csv",
         "globex_xml": data_dir / "extracted_globex.xml",
         "filed_csv": data_dir / "filed_customs_ledger.csv",
+        "gold_csv": data_dir / "gold_truth.csv",
         "tariff_csv": data_dir / "tariff_codes.csv",
         "amendments_csv": data_dir / "amendments_truth.csv",
+        "errors_csv": data_dir / "injected_errors_truth.csv",
     }
     _write_acme_csv(acme_entries, paths["acme_csv"])
     _write_globex_xml(globex_entries, paths["globex_xml"])
     _write_filed_csv(filed_entries, paths["filed_csv"])
+    _write_filed_csv(gold_entries, paths["gold_csv"])
     _write_tariff_csv(paths["tariff_csv"])
     _write_amendments_csv(amendment_rows, paths["amendments_csv"])
+    _write_injected_errors_csv(injected_error_rows, paths["errors_csv"])
 
+    styles = [row["style"] for row in injected_error_rows]
     return {
         "n_docs": n_docs,
         "n_items": n_items_total,
@@ -761,6 +907,10 @@ def generate(n_docs: int = 3000, seed: int = 42, data_dir: str | Path = "data") 
         "n_acme": len(acme_entries),
         "n_globex": len(globex_entries),
         "n_amended_docs": len({row["doc_id"] for row in amendment_rows}),
+        "n_injected_errors": len(injected_error_rows),
+        "n_noise_errors": styles.count(NOISE),
+        "n_fabrications": styles.count(FABRICATION),
+        "n_structural_errors": styles.count(STRUCTURAL),
         "paths": {name: str(p) for name, p in paths.items()},
     }
 
@@ -776,6 +926,10 @@ def main() -> None:
         f"Generated {summary['n_docs']} documents with {summary['n_items']} goods items "
         f"({summary['n_acme']} Acme CSV, {summary['n_globex']} Globex XML), "
         f"{summary['n_amended_docs']} legitimately amended after filing."
+    )
+    print(
+        f"Injected {summary['n_injected_errors']} errors: {summary['n_noise_errors']} noise, "
+        f"{summary['n_fabrications']} fabrications, {summary['n_structural_errors']} structural."
     )
     for name, path in summary["paths"].items():
         print(f"  {name}: {path}")

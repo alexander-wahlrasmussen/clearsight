@@ -512,6 +512,107 @@ def _alignment_summary(doc_summary: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# cross-regime analyses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LeadingIndicators:
+    """How predictive the blind signals (validity failures, low confidence)
+    are of the critical mismatches only visible after filing."""
+
+    frame: pd.DataFrame            # one row per signal: docs, hit rate, lift
+    masks: dict[str, pd.Series]    # signal -> boolean mask over doc_summary rows
+    confidence_floor: float
+
+
+def leading_indicators(
+    doc_summary: pd.DataFrame,
+    validity_results: pd.DataFrame,
+    confidence_floor: float = 0.8,
+) -> LeadingIndicators:
+    """The blind-regime question: in production, before any filed record
+    exists, the only per-document signals are validity failures and low
+    confidence.  How much do they tell you about the errors the proxy will
+    eventually reveal?  Lift = a signal's error rate over the base rate;
+    the "neither signal" row is the residual risk no blind gate can see
+    (fabricated-but-plausible values chief among it)."""
+    failed_docs = set(validity_results.loc[~validity_results["passed"], "doc_id"])
+    validity_mask = doc_summary["doc_id"].isin(failed_docs)
+    confidence = doc_summary["min_critical_confidence"]
+    confidence_mask = confidence.isna() | (confidence < confidence_floor)
+    has_critical_error = doc_summary["critical_mismatches"] > 0
+    base_rate = float(has_critical_error.mean()) if len(doc_summary) else math.nan
+
+    masks = {
+        "all documents (base rate)": pd.Series(True, index=doc_summary.index),
+        "any validity failure": validity_mask,
+        f"min tier-1 confidence < {confidence_floor} or missing": confidence_mask,
+        "either blind signal": validity_mask | confidence_mask,
+        "neither signal (looks clean ex ante)": ~(validity_mask | confidence_mask),
+    }
+    rows = []
+    for signal, mask in masks.items():
+        selected = doc_summary[mask]
+        hits = int((selected["critical_mismatches"] > 0).sum())
+        rate = hits / len(selected) if len(selected) else math.nan
+        rows.append(
+            {
+                "signal": signal,
+                "documents": len(selected),
+                "docs_with_critical_mismatch": hits,
+                "critical_mismatch_rate": rate,
+                "lift_vs_base": rate / base_rate if base_rate else math.nan,
+            }
+        )
+    return LeadingIndicators(
+        frame=pd.DataFrame(rows), masks=masks, confidence_floor=confidence_floor
+    )
+
+
+def proxy_disagreement(
+    proxy_comparisons: pd.DataFrame, gold_comparisons: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split the proxy's verdicts by what the gold standard says.
+
+    Returns (false_alarms, hidden_errors):
+      false_alarms   mismatch vs filed but match vs gold -- the proxy's
+                     noise, overwhelmingly post-filing amendments.
+      hidden_errors  match vs filed but mismatch vs gold -- extraction and
+                     filing wrong in the same way; near zero here, and the
+                     population that grows once auto-accepted extractions
+                     start being filed verbatim (the feedback loop).
+
+    Joins field rows on the extracted side's identity (doc, level, field,
+    extracted item number), which both regimes share; structure rows have
+    no such shared key and are excluded.
+    """
+
+    def keyed(frame: pd.DataFrame) -> pd.DataFrame:
+        fields = frame[frame["level"] != STRUCTURE].copy()
+        # None item numbers (header rows) must still join: NaN never equals
+        # NaN in a pandas merge, so use a sentinel.
+        fields["item_key"] = (
+            pd.to_numeric(fields["item_no_extracted"], errors="coerce").fillna(-1).astype(int)
+        )
+        return fields
+
+    keys = ["doc_id", "level", "field", "item_key"]
+    proxy_side = keyed(proxy_comparisons)
+    gold_side = keyed(gold_comparisons)[keys + ["status", "filed_value", "reason"]].rename(
+        columns={"status": "status_gold", "filed_value": "gold_value", "reason": "reason_gold"}
+    )
+    merged = proxy_side.merge(gold_side, on=keys, how="inner")
+    false_alarms = merged[
+        (merged["status"] == MISMATCH) & (merged["status_gold"] == MATCH)
+    ].drop(columns=["item_key"])
+    hidden_errors = merged[
+        (merged["status"] == MATCH) & (merged["status_gold"] == MISMATCH)
+    ].drop(columns=["item_key"])
+    return false_alarms, hidden_errors
+
+
+# ---------------------------------------------------------------------------
 # persistence
 # ---------------------------------------------------------------------------
 

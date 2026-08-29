@@ -25,16 +25,20 @@ and the HTML report to `out/`.  Both directories are gitignored.
 ## What the layers are, and why they are separate
 
 ```
-canonical.py          header + goods items: the shape every source maps into
-readers/              one module per source system: read(path) -> [CanonicalRecord]
-alignment.py          pairs extracted goods items with filed goods items
-comparators.py        versioned field comparators: match / mismatch / not_comparable
-field_tiers.yaml      which field is how critical, judged by which comparator
-validity.py           deterministic rules that need no ground truth
-evaluate.py           join docs, align items, apply comparators, aggregate
-report.py             one self-contained HTML file, every number clickable
-generate_synthetic.py paired records with deliberately injected error patterns
-run_demo.py           end to end
+canonical.py           header + goods items: the shape every source maps into
+readers/               one module per source system: read(path) -> [CanonicalRecord]
+alignment.py           pairs extracted goods items with filed goods items
+comparators.py         versioned field comparators: match / mismatch / not_comparable
+field_tiers.yaml       which field is how critical, judged by which comparator
+validity.py            deterministic rules that need no ground truth
+evaluate.py            join docs, align items, apply comparators, aggregate;
+                       plus the cross-regime analyses (leading indicators,
+                       proxy-vs-gold disagreement)
+uncertainty.py         error bars: bootstrap, Wilson intervals, audit-sample estimator
+confidence_quality.py  is the confidence score any good: ECE, Brier, AUROC
+report.py              one self-contained HTML file, every number clickable
+generate_synthetic.py  paired records with deliberately injected error patterns
+run_demo.py            end to end, across all three evaluation regimes
 ```
 
 The separation is the point:
@@ -82,6 +86,69 @@ sides number their lines independently.
   `field_tiers.yaml` assigns them (tier 1 by default), so a dropped line
   makes a document not clean exactly like a wrong HS code does.
 
+## Three evaluation regimes
+
+The same extraction gets scored three ways, because production only ever
+has some of them:
+
+- **Truth (gold).**  The generator writes the true records to
+  `data/gold_truth.csv` — same schema as the ledger export, same reader,
+  same evaluator.  This regime only exists here because the data is
+  synthetic; in production its stand-in is a periodically drawn,
+  human-graded audit sample.
+- **Proxy (the filed record).**  Available for every document, but days
+  late and noisy: amendments count as errors, and agreement can hide
+  shared mistakes.  This is what the report's main sections score against,
+  because it is what production sees.
+- **Blind (validity rules + confidence).**  Available instantly, before
+  filing, with no reference at all.
+
+Having gold and proxy side by side makes the **proxy bias measurable**
+instead of hand-waved: the report shows both clean rates and splits every
+proxy verdict by what gold says — *false alarms* (mismatch vs filed, match
+vs gold: the amendments) and *hidden errors* (match vs filed, mismatch vs
+gold: extraction and filing wrong the same way).  Hidden errors are near
+zero while filings are independent of extraction; they are the number that
+silently grows once auto-accepted extractions start being filed verbatim —
+the feedback loop that eventually makes the proxy metric worthless on the
+auto-accepted segment.
+
+The **audit-sample estimator** (`uncertainty.audit_sample_estimate`) is
+the production bridge: draw K documents, grade only those against truth,
+and the Wilson interval says what the sample is worth.  The report shows
+K = 50/150/500 so the cost-of-precision curve is visible — you don't buy
+gold for the population, you buy a well-drawn sample to calibrate your
+proxy.
+
+The **leading-indicators table** measures the blind regime: for documents
+flagged by a validity failure or low confidence, how much likelier is an
+eventual tier-1 mismatch (lift over the base rate) — and, in the "neither
+signal" row, how much damage looks perfectly clean ex ante.
+
+## OCR noise vs LLM fabrication
+
+The generator injects errors in three styles, tagged in
+`data/injected_errors_truth.csv`, because OCR systems and LLM extractors
+fail differently:
+
+- **noise** (OCR-era): digit confusion, truncated codes, swapped dates,
+  missing fields — garbage that often *looks* like garbage, so checksums,
+  format rules and arithmetic catch a good share of it;
+- **fabrication** (LLM-era): a *different but valid* EORI (right country,
+  right length, correct check digit), an *in-tariff* HS sibling from the
+  same chapter, a *real but wrong* origin country — delivered with high
+  confidence.  Fluent garbage.  It passes every validity rule by
+  construction, and it is exactly what confidence gates wave through;
+- **structural**: dropped, merged and invented goods items.
+
+`run_demo.py` runs a clearly-labelled synthetic-only diagnostic (it reads
+the truth sidecar, which the harness proper never does) reporting the
+share of each style that any blind signal actually pointed at.  In the
+default run: roughly half of the noise, most of the structural (the
+item-sum rule), and effectively none of the fabrications.  That asymmetry
+is the operational argument for keeping the proxy and audit regimes
+running even when blind monitoring looks healthy.
+
 ## Why clean document rate is the headline
 
 The headline metric is **clean_document_rate**: the share of documents
@@ -127,6 +194,34 @@ from the extracted record alone — which exposes the ugliest property of
 confidence gating: a document whose extraction silently dropped a goods
 item still auto-accepts, because the missing line has no score to be low.
 The escaped-error column includes those documents on purpose.
+
+`confidence_quality.py` separates the two properties the calibration table
+conflates:
+
+- **calibration** (ECE, Brier): does 0.9 mean 90%?  Fixable after the fact
+  by recalibration, if the ranking underneath is sound;
+- **discrimination** (AUROC, the rank-based Mann-Whitney form): do wrong
+  fields score lower than correct ones *at all*?  Not fixable by any
+  recalibration — and the auto-accept gate only uses the ranking, so AUROC
+  is what decides whether a confidence gate can work.
+
+Both are computed against gold *and* against the proxy, which demonstrates
+label-noise attenuation: the same score's measured discrimination is lower
+against the noisy proxy than it truly is (while apparent calibration can
+drift either way).  Per-field quality matters more than the pooled number:
+a pooled 0.9 hides that 0.9 on an HS code and 0.9 on a date mean different
+things — and in the demo, the fields fabrication targets are precisely the
+ones whose AUROC collapses.
+
+## Error bars
+
+Every headline proportion carries an interval, stdlib-computed
+(`uncertainty.py`): a percentile **bootstrap** (resampling documents) for
+the clean document rate — shown as the general tool that works for any
+statistic — and closed-form **Wilson intervals** for every
+country × source-system slice and the audit samples.  The point of the
+per-slice intervals is to stop over-reading small cells: a two-point
+difference between slices whose intervals overlap is not a finding.
 
 ## Validity rules
 
@@ -194,6 +289,15 @@ Read these before quoting any number from the report.
 8. **The join trusts doc_id.**  Extracted documents that never got filed,
    and filed documents we never extracted, are counted and listed but not
    diagnosed.
+9. **The blind regime cannot see fabrications.**  Valid-looking,
+   high-confidence, wrong values pass every validity rule by construction
+   and sail through confidence gates.  The synthetic diagnostic quantifies
+   it; nothing in this harness fixes it.  The only countermeasures are the
+   proxy and the audited gold sample — which is why they exist.
+10. **The audit estimator assumes an honest random sample.**  Real audit
+    queues are rarely random (they oversample flagged documents); a
+    non-random sample needs reweighting the estimator does not do.  And a
+    95% interval still misses one run in twenty.
 
 ## Traceability
 
@@ -209,7 +313,8 @@ Outputs written by a run:
 | file | contents |
 |---|---|
 | `out/report.html` | the self-contained report |
-| `out/field_comparisons.csv` | every comparison with level, item numbers, reason |
+| `out/field_comparisons.csv` | every comparison with level, item numbers, reason (vs filed) |
+| `out/gold/*.csv` | the same evaluation frames, scored vs gold truth |
 | `out/doc_summary.csv` | per-document mismatch and item counts, min tier-1 confidence, clean flag |
 | `out/per_field.csv` | precision / recall per header and item field |
 | `out/breakdown.csv` | mismatches by country × source system |
@@ -217,18 +322,28 @@ Outputs written by a run:
 | `out/straight_through.csv` | auto-accept share and escaped errors per threshold |
 | `out/alignment_summary.csv` | items paired / missed / spurious per source system |
 | `out/validity_failures.csv` | every failed validity check with reason |
+| `out/leading_indicators.csv` | blind signals vs eventual tier-1 mismatches, with lift |
+| `out/confidence_summary.csv` | ECE / Brier / AUROC per regime |
+| `out/confidence_per_field.csv` | calibration gap and AUROC per field (vs gold) |
+| `out/audit_estimates.csv` | audit-sample clean-rate estimates with Wilson CIs |
+
+Truth files written by the generator (read by humans and by run_demo's
+labelled diagnostics, never by the harness proper): `data/gold_truth.csv`,
+`data/amendments_truth.csv`, `data/injected_errors_truth.csv`.
 
 ## The synthetic data
 
 `generate_synthetic.py` produces a few thousand paired multi-item
 declarations with the error patterns real customs extraction actually
-shows.  Field-level: OCR digit confusion in totals, item values, weights,
-EORI and BL references; HS codes truncated to 6 digits; day/month swaps;
-missing origins; wrong supplementary units; incoterm and currency
-confusion.  Structural: dropped last lines, two same-chapter lines merged
-into one, and subtotal rows read as goods items — multi-item documents
-deliberately include same-chapter items so alignment has something
-genuinely hard to do.  The NL lane is systematically ~2.5× worse than DE,
-because someone's scans always are.  Confidence scores are imperfectly
-honest: corrupted fields tend to score lower, the distributions overlap,
-and dropped lines produce no score at all.
+shows, in the three styles described above.  Noise: OCR digit confusion in
+totals, item values, weights, EORI and BL references; HS codes truncated
+to 6 digits; day/month swaps; missing origins; wrong supplementary units;
+incoterm and currency confusion.  Fabrication: valid-but-wrong EORIs, HS
+siblings and origins, at high confidence.  Structural: dropped last lines,
+two same-chapter lines merged into one, and subtotal rows read as goods
+items — multi-item documents deliberately include same-chapter items so
+alignment has something genuinely hard to do.  The NL lane is
+systematically ~2.5× worse than DE, because someone's scans always are.
+Confidence scores are imperfectly honest: noise-corrupted fields tend to
+score lower, fabricated fields score high, the distributions overlap, and
+dropped lines produce no score at all.
