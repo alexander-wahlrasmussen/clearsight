@@ -46,6 +46,21 @@ CALIBRATION_BUCKETS = [f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10)]
 
 HEADER, ITEM, STRUCTURE = "header", "item", "structure"
 
+# Declared once so the comparisons frame has these columns even when no
+# documents join at all (see _compare_all) -- every aggregation below and
+# the report rely on them being present.
+COMPARISON_COLUMNS = [
+    "doc_id", "level", "field", "tier", "country", "source_system",
+    "item_no_extracted", "item_no_filed", "alignment_score", "alignment_basis",
+    "extracted_value", "filed_value", "extracted_present", "filed_present",
+    "status", "reason", "confidence", "comparator", "comparator_version",
+]
+DOC_SUMMARY_COLUMNS = [
+    "doc_id", "country", "source_system", "not_comparable",
+    "extracted_items", "filed_items", "paired_items", "missed_items",
+    "spurious_items", "min_critical_confidence", "critical_mismatches", "clean",
+]
+
 
 # ---------------------------------------------------------------------------
 # configuration (field_tiers.yaml)
@@ -292,7 +307,9 @@ def _compare_all(
             "min_critical_confidence": _min_critical_confidence(record, tiers),
         }
 
-    comparisons = pd.DataFrame(rows)
+    # Explicit columns so an empty join (nothing matched on doc_id) still
+    # yields a well-formed frame instead of crashing downstream.
+    comparisons = pd.DataFrame(rows, columns=COMPARISON_COLUMNS)
     comparisons["confidence"] = pd.to_numeric(comparisons["confidence"], errors="coerce")
     comparisons["confidence_bucket"] = comparisons["confidence"].map(_bucket_label)
     return comparisons, doc_stats, unmatched_extracted, unmatched_filed
@@ -340,6 +357,8 @@ def _summarise_documents(
     """One row per document: mismatch counts per tier, item alignment
     outcomes, the ex-ante minimum critical confidence, and the clean flag
     that feeds the headline."""
+    if comparisons.empty:
+        return pd.DataFrame(columns=DOC_SUMMARY_COLUMNS)
     summary = comparisons.groupby("doc_id").agg(
         country=("country", "first"),
         source_system=("source_system", "first"),
@@ -371,6 +390,12 @@ def _per_field_metrics(comparisons: pd.DataFrame, tiers: TiersConfig) -> pd.Data
                  where the tool extracted a matching one.  A value the tool
                  failed to extract hurts recall, not precision.
     """
+    columns = [
+        "level", "field", "tier", "comparator", "n_comparisons", "matches",
+        "mismatches", "missing_extracted", "unparseable", "precision", "recall",
+    ]
+    if comparisons.empty:
+        return pd.DataFrame(columns=columns)
     specs = {**tiers.header_fields, **tiers.item_fields}
     field_rows = comparisons[comparisons["level"] != STRUCTURE]
     rows = []
@@ -403,6 +428,12 @@ def _mismatch_breakdown(
     comparisons: pd.DataFrame, doc_summary: pd.DataFrame, critical_tier: int
 ) -> pd.DataFrame:
     """Mismatch counts by country of filing and extraction source system."""
+    columns = [
+        "country", "source_system", "documents", "clean_document_rate",
+        "mismatches", "critical_mismatches", "critical_mismatch_rate",
+    ]
+    if comparisons.empty:
+        return pd.DataFrame(columns=columns)
     rows = []
     for (country, system), group in comparisons.groupby(["country", "source_system"]):
         critical = group[group["tier"] == critical_tier]
@@ -492,6 +523,12 @@ def _straight_through(doc_summary: pd.DataFrame, thresholds: list[float]) -> pd.
 def _alignment_summary(doc_summary: pd.DataFrame) -> pd.DataFrame:
     """Item pairing outcomes per source system: how many goods items each
     side had, how many paired, how many were missed or spurious."""
+    columns = [
+        "source_system", "documents", "extracted_items", "filed_items",
+        "paired_items", "missed_items", "spurious_items", "docs_with_structure_defects",
+    ]
+    if doc_summary.empty:
+        return pd.DataFrame(columns=columns)
     rows = []
     for system, group in doc_summary.groupby("source_system"):
         rows.append(

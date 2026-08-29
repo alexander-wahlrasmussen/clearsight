@@ -39,10 +39,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from canonical import CanonicalItem
-from comparators import parse_number
+from comparators import normalise_country, parse_number
 
 ALIGNER_NAME = "greedy_item_aligner"
-ALIGNER_VERSION = "1.0"
+ALIGNER_VERSION = "1.1"  # 1.1: origins normalised like the iso_country comparator
 
 # Score for the deepest shared HS prefix, keyed by digits of agreement.
 # Only the hierarchy's real boundaries count (chapter/heading/subheading/
@@ -108,8 +108,12 @@ def _pair_score(extracted: CanonicalItem, filed: CanonicalItem) -> tuple[float, 
     value_closeness = _closeness(extracted.item_value, filed.item_value)
     quantity_closeness = _closeness(extracted.quantity, filed.quantity)
 
-    if extracted.origin_country and filed.origin_country:
-        origin_score = 1.0 if extracted.origin_country.strip().upper() == filed.origin_country.strip().upper() else 0.0
+    # Same normalisation the iso_country comparator applies, so "CHINA" and
+    # "CN" agree here exactly as they would in the field comparison.
+    extracted_origin = normalise_country(extracted.origin_country) if extracted.origin_country else None
+    filed_origin = normalise_country(filed.origin_country) if filed.origin_country else None
+    if extracted_origin and filed_origin:
+        origin_score = 1.0 if extracted_origin == filed_origin else 0.0
         origin_text = "origin agrees" if origin_score else "origin differs"
     else:
         origin_score = 0.5  # unknown: neither evidence for nor against

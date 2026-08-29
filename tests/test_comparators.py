@@ -38,11 +38,31 @@ class TestExactCode:
         assert "filed" in ExactCode().compare("CIF", None).reason
 
 
+class TestParseNumber:
+    def test_english_and_european_formats_agree(self):
+        from comparators import parse_number
+
+        assert parse_number("12,500.00") == 12500.0   # English grouping
+        assert parse_number("12.500,00") == 12500.0   # European grouping
+        assert parse_number("1234,56") == 1234.56     # lone comma = decimal mark
+        assert parse_number("1,234") == 1234.0        # perfect 3-digit groups = grouping
+        assert parse_number("12,34") == 12.34         # not groups of three = decimal
+        assert parse_number("1.234") == 1.234         # lone dot stays a decimal mark
+
+    def test_garbage_is_none_not_a_number(self):
+        from comparators import parse_number
+
+        assert parse_number("1,2,3") is None
+        assert parse_number("12x34") is None
+        assert parse_number(True) is None
+
+
 class TestNumericWithTolerance:
     def test_exact_match_across_formats(self):
         comparator = NumericWithTolerance(pct=0.0)
         assert comparator.compare("12", "12.0").status == MATCH
         assert comparator.compare("12,500.00", 12500).status == MATCH
+        assert comparator.compare("12.500,00", 12500).status == MATCH
 
     def test_within_tolerance(self):
         assert NumericWithTolerance(pct=0.5).compare(100.5, 100.0).status == MATCH

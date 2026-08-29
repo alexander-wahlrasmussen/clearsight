@@ -14,9 +14,9 @@ Netherlands**, with 1–5 goods items per declaration.
 ## Quick start
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt   # Python 3.10+; pandas and PyYAML only
 python run_demo.py        # generates data, evaluates, opens out/report.html
-pytest                    # tests for comparators, validity rules and alignment
+pytest                    # unit tests plus an end-to-end smoke test
 ```
 
 `run_demo.py` writes synthetic source files to `data/`, row-level results

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from comparators import parse_number
+
 
 def text_or_none(value) -> str | None:
     """Empty / whitespace-only strings become None."""
@@ -18,13 +20,13 @@ def text_or_none(value) -> str | None:
 
 
 def float_or_none(value) -> float | None:
+    """Delegates to comparators.parse_number so the whole harness has
+    exactly one opinion about what a number string means (including
+    European decimal commas)."""
     text = text_or_none(value)
     if text is None:
         return None
-    try:
-        return float(text.replace(",", ""))
-    except ValueError:
-        return None
+    return parse_number(text)
 
 
 def int_or_none(value) -> int | None:

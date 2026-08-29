@@ -47,11 +47,16 @@ def read(path: str | Path) -> list[CanonicalRecord]:
 
 
 def _confidences(row: dict, prefix: str) -> dict[str, float]:
-    return {
-        column[len(prefix):]: float(value)
-        for column, value in row.items()
-        if column.startswith(prefix) and text_or_none(value) is not None
-    }
+    """A junk confidence cell ("N/A") is dropped, like every other field
+    this layer cannot parse -- one dirty cell must not sink the file."""
+    scores = {}
+    for column, value in row.items():
+        if not column.startswith(prefix):
+            continue
+        score = float_or_none(value)
+        if score is not None:
+            scores[column[len(prefix):]] = score
+    return scores
 
 
 def _to_item(row: dict) -> CanonicalItem:

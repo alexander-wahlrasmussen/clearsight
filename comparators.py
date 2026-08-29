@@ -118,14 +118,37 @@ class ExactCode(Comparator):
 # ---------------------------------------------------------------------------
 
 
+_GROUPED_THOUSANDS = re.compile(r"[+-]?\d{1,3}(,\d{3})+")
+
+
 def parse_number(value) -> float | None:
-    """Parse a number as sources tend to write them ("12,500.00")."""
+    """Parse a number as sources actually write them, including the
+    European decimal comma our DE/NL sources use.
+
+    "12,500.00" and "12.500,00" both mean 12500.  When both separators
+    appear, the rightmost one is the decimal mark.  A comma on its own is
+    a decimal mark ("1234,56") unless the digits fall in perfect groups of
+    three ("1,234"), which reads as thousands grouping.  A dot on its own
+    is taken as a decimal mark.  Anything unparseable returns None --
+    callers must treat that as not comparable, never as a match.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return float(value)
+    text = str(value).strip().replace(" ", "")
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")  # 1.234,56 -> 1234.56
+        else:
+            text = text.replace(",", "")                    # 1,234.56 -> 1234.56
+    elif "," in text:
+        if _GROUPED_THOUSANDS.fullmatch(text):
+            text = text.replace(",", "")                    # 1,234 -> 1234
+        else:
+            text = text.replace(",", ".")                   # 1234,56 -> 1234.56
     try:
-        return float(str(value).replace(",", "").replace(" ", ""))
+        return float(text)
     except ValueError:
         return None
 
@@ -138,7 +161,7 @@ class NumericWithTolerance(Comparator):
     """
 
     name = "numeric_with_tolerance"
-    VERSION = "1.0"
+    VERSION = "1.1"  # 1.1: parse_number understands European decimal commas
 
     def __init__(self, pct: float = 0.0):
         super().__init__()

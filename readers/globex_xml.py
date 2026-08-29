@@ -53,13 +53,18 @@ def read(path: str | Path) -> list[CanonicalRecord]:
 
 
 def _confidences(parent: ET.Element | None) -> dict[str, float]:
+    """Field scores from a node's own Confidence child.  findall with a
+    relative path only looks at direct children, so calling this on a
+    Document never picks up the per-Item scores.  A junk score is dropped
+    rather than crashing the read."""
     if parent is None:
         return {}
-    return {
-        f.get("name"): float(f.get("score"))
-        for f in parent.findall("Confidence/Field")
-        if f.get("name") and f.get("score")
-    }
+    scores = {}
+    for field in parent.findall("Confidence/Field"):
+        name, score = field.get("name"), float_or_none(field.get("score"))
+        if name and score is not None:
+            scores[name] = score
+    return scores
 
 
 def _to_item(item: ET.Element) -> CanonicalItem:
@@ -95,13 +100,7 @@ def _to_canonical(doc: ET.Element) -> CanonicalRecord:
         bl_reference=_attr(doc.find("Commercial/Transport"), "blReference"),
         invoice_date=_attr(invoice, "date"),
         items=[_to_item(item) for item in doc.findall("Goods/Item")],
-        # Direct child only: item Confidence elements must not leak into
-        # the header confidences.
-        extraction_confidence={
-            f.get("name"): float(f.get("score"))
-            for f in doc.findall("./Confidence/Field")
-            if f.get("name") and f.get("score")
-        },
+        extraction_confidence=_confidences(doc),
         timestamp=datetime_or_none(doc.get("extractedAt")),
     )
 

@@ -1,7 +1,10 @@
 import math
+from pathlib import Path
 
 import pandas as pd
 
+import evaluate
+from canonical import CanonicalItem, CanonicalRecord
 from evaluate import leading_indicators, proxy_disagreement
 
 
@@ -60,6 +63,37 @@ class TestLeadingIndicators:
         result = leading_indicators(doc_summary(), validity_results(), confidence_floor=0.8)
         for _, row in result.frame.iterrows():
             assert int(result.masks[row["signal"]].sum()) == row["documents"]
+
+
+def _record(doc_id: str) -> CanonicalRecord:
+    item = CanonicalItem(
+        item_number=1, hs_code="8471300000", origin_country="CN",
+        quantity=10.0, quantity_unit="NAR", item_value=1000.0,
+        gross_weight=100.0, net_weight=90.0, package_count=2,
+        extraction_confidence={},
+    )
+    return CanonicalRecord(
+        shipment_id="SHP", doc_id=doc_id, country="DE", source_system="test",
+        declared_value=1000.0, currency="EUR", incoterm="CIF",
+        importer_eori="DE123456789012345", bl_reference="MSCU1234567",
+        invoice_date="2026-05-04", items=[item],
+        extraction_confidence={}, timestamp=None,
+    )
+
+
+class TestEvaluateWithNoJoinedDocuments:
+    def test_reports_the_unmatched_lists_instead_of_crashing(self):
+        # Wrong file pairing / empty batch: nothing shares a doc_id.
+        tiers = evaluate.load_field_tiers(Path(__file__).parent.parent / "field_tiers.yaml")
+        result = evaluate.evaluate([_record("DOC-A")], [_record("DOC-B")], tiers)
+        assert result.n_joined == 0
+        assert result.unmatched_extracted == ["DOC-A"]
+        assert result.unmatched_filed == ["DOC-B"]
+        assert math.isnan(result.clean_document_rate)
+        assert result.comparisons.empty
+        assert result.doc_summary.empty
+        assert result.per_field.empty and result.breakdown.empty
+        assert len(result.straight_through) > 0  # thresholds still listed, all NaN
 
 
 def comparison_rows(rows) -> pd.DataFrame:

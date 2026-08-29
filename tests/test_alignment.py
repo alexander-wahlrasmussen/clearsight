@@ -98,6 +98,17 @@ class TestAlignItems:
         assert len(alignment.unmatched_filed) == 1
         assert align_items([], [], MIN_SCORE).pairs == []
 
+    def test_spelled_out_origin_counts_as_agreement(self):
+        # "CHINA" and "CN" are the same country to the iso_country
+        # comparator, so they must be the same country to the aligner too.
+        alignment = align_items(
+            [item(1, "8471300000", 100.0, origin="CHINA")],
+            [item(1, "8471300000", 100.0, origin="CN")],
+            MIN_SCORE,
+        )
+        assert alignment.pairs[0].score == 1.0
+        assert "origin agrees" in alignment.pairs[0].basis
+
     def test_basis_explains_the_pairing(self):
         alignment = align_items(
             [item(1, "8471300000", 102.0)], [item(1, "8471300000", 100.0)], MIN_SCORE
