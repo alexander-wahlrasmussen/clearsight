@@ -101,6 +101,13 @@ def test_report_builds_with_all_extras(pipeline, tmp_path):
     )
     path = report.build_report(proxy_ev, validity_df, tmp_path / "report.html", extras)
     html = path.read_text(encoding="utf-8")
+    assert 'class="story-section"' in html
+    assert "ONE DOCUMENT" in html
+    assert "A POLICY TO VALIDATE" in html
+    assert "The takeaway" in html
+    assert "no mismatch found vs filing (not verified)" in html
+    assert "would go to review (no review queue exists yet)" in html
+    assert "Missing fields are caught; missing lines are not." in html
     assert "Three ways to score the same extraction" in html
     assert "Is the confidence score any good?" in html
     assert html.count('class="drilldown"') == html.count('class="drill"')
