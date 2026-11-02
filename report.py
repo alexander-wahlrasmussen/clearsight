@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from comparators import MISMATCH
+from comparators import MISMATCH, NOT_COMPARABLE
 from compare_models import HeadToHead, ModelComparison
 from confidence_quality import ConfidenceQualitySummary
 from evaluate import Evaluation, LeadingIndicators
@@ -221,6 +221,298 @@ def _join_note(ev: Evaluation, dd: _Drilldowns) -> str:
             f"{len(frame)} filed but never extracted", "Filed but never extracted", frame
         ))
     return " &middot; ".join(parts)
+
+
+def _story_item_card(label: str, item_number, values: dict[str, object]) -> str:
+    """Render the few item facts needed to follow the opening case."""
+    details = [
+        ("HS code", values.get("hs_code")),
+        ("Value", values.get("item_value")),
+        ("Origin", values.get("origin_country")),
+        ("Quantity", values.get("quantity")),
+        ("Unit", values.get("quantity_unit")),
+    ]
+    facts = " ".join(
+        f'<span><small>{esc(name)}</small>{_fmt(value) if value is not None else "&ndash;"}</span>'
+        for name, value in details
+    )
+    number = "?" if item_number is None or pd.isna(item_number) else _fmt(item_number)
+    return (
+        '<div class="story-item">'
+        f'<strong>{esc(label)} {number}</strong>'
+        f'<div class="story-facts">{facts}</div></div>'
+    )
+
+
+def _story_section(ev: Evaluation, dd: _Drilldowns, extras: ReportExtras) -> str:
+    """Put one auditable document and the agreement-vs-correctness lesson first."""
+    comparisons = ev.comparisons
+    structures = comparisons[
+        (comparisons["level"] == "structure")
+        & (comparisons["status"] == MISMATCH)
+    ].sort_values(["doc_id", "field"])
+
+    case_doc = structures.iloc[0]["doc_id"] if not structures.empty else None
+    if case_doc is None:
+        critical = comparisons[
+            (comparisons["status"] == MISMATCH)
+            & (comparisons["tier"] == ev.critical_tier)
+        ].sort_values("doc_id")
+        case_doc = critical.iloc[0]["doc_id"] if not critical.empty else None
+    if case_doc is None and not ev.doc_summary.empty:
+        case_doc = ev.doc_summary.sort_values("doc_id").iloc[0]["doc_id"]
+
+    case_rows = (
+        comparisons[comparisons["doc_id"] == case_doc]
+        if case_doc is not None else comparisons.head(0)
+    )
+    case_structures = case_rows[
+        (case_rows["level"] == "structure")
+        & (case_rows["status"] == MISMATCH)
+    ]
+    paired_rows = case_rows[case_rows["level"] == "item"]
+    pair_groups: dict[tuple, pd.DataFrame] = {}
+    for key, group in paired_rows.groupby(
+        ["item_no_extracted", "item_no_filed"], dropna=False, sort=False
+    ):
+        pair_groups[key] = group
+
+    pair_cards = []
+    for (extracted_no, filed_no), group in pair_groups.items():
+        extracted_values = dict(zip(group["field"], group["extracted_value"]))
+        filed_values = dict(zip(group["field"], group["filed_value"]))
+        pair_cards.append(
+            '<div class="story-pair">'
+            + _story_item_card("Extracted line", extracted_no, extracted_values)
+            + '<div class="story-link" aria-label="paired by content">MATCH</div>'
+            + _story_item_card("Filed line", filed_no, filed_values)
+            + "</div>"
+        )
+
+    unmatched_cards = []
+    for row in case_structures.itertuples():
+        if row.field == "missed_item":
+            unmatched_cards.append(
+                '<div class="story-pair">'
+                '<div class="story-item story-empty"><strong>No extracted line matched</strong>'
+                '<div class="story-facts">The comparison could not find a partner.</div></div>'
+                '<div class="story-link story-unmatched" aria-label="no match">NO MATCH</div>'
+                f'<div class="story-item story-alert"><strong>Filed line {_fmt(row.item_no_filed)}</strong>'
+                f'<div class="story-facts">{esc(row.filed_value)}</div></div></div>'
+            )
+        elif row.field == "spurious_item":
+            unmatched_cards.append(
+                '<div class="story-pair">'
+                f'<div class="story-item story-alert"><strong>Extracted line {_fmt(row.item_no_extracted)}</strong>'
+                f'<div class="story-facts">{esc(row.extracted_value)}</div></div>'
+                '<div class="story-link story-unmatched" aria-label="no match">NO MATCH</div>'
+                '<div class="story-item story-empty"><strong>No filed line matched</strong>'
+                '<div class="story-facts">The comparison could not find a partner.</div></div></div>'
+            )
+
+    if not pair_cards and not unmatched_cards:
+        mismatches = case_rows[case_rows["status"] == MISMATCH]
+        if not mismatches.empty:
+            row = mismatches.iloc[0]
+            pair_cards.append(
+                '<div class="story-pair">'
+                f'<div class="story-item"><strong>Extracted {esc(row["field"])}</strong>'
+                f'<div class="story-facts">{_fmt(row["extracted_value"])}</div></div>'
+                '<div class="story-link story-unmatched" aria-label="values differ">DIFFERS</div>'
+                f'<div class="story-item story-alert"><strong>Filed {esc(row["field"])}</strong>'
+                f'<div class="story-facts">{_fmt(row["filed_value"])}</div></div></div>'
+            )
+
+    if case_doc is None:
+        case_content = '<p>No joined documents are available to illustrate a comparison.</p>'
+    else:
+        case_content = (
+            f'<p class="story-kicker">ONE DOCUMENT &middot; {esc(case_doc)}</p>'
+            + "".join(pair_cards + unmatched_cards)
+            + '<p class="story-caption">Pairing is a content-based hypothesis, not proof of identity. '
+            'A mismatch against a filed record is a reason to investigate, not by itself proof that extraction was wrong.</p>'
+            + dd.link("Open this document's comparison rows",
+                      f"Evidence for {case_doc}", case_rows, COMPARISON_COLUMNS)
+        )
+
+    case_confidence = ev.doc_summary.loc[
+        ev.doc_summary["doc_id"] == case_doc, "min_critical_confidence"]
+    if case_doc is not None and len(case_confidence) and pd.notna(case_confidence.iloc[0]):
+        case_content += (
+            '<p class="story-caption">The extractor\'s lowest confidence on an important field here is '
+            f'<strong>{float(case_confidence.iloc[0]):.3f}</strong>. Nothing in the scores points the '
+            'reviewer to the missing line, because a line that was never extracted has no score.</p>'
+        )
+
+    agreement_content = (
+        '<p>Suppose a document says EUR 1,000, the extraction says EUR 100 and the reviewer submits '
+        'EUR 100 unchanged. Extraction and filing agree, and both are wrong. Only an independent '
+        'check of the source can tell.</p>'
+    )
+    scenario = extras.synthetic_review
+    gold = extras.gold_evaluation
+    if scenario is not None and gold is not None and extras.hidden_errors is not None:
+        def clean_link(evaluation: Evaluation, label: str) -> tuple[str, float]:
+            rate = evaluation.clean_document_rate
+            rows = evaluation.doc_summary
+            text = f"{rate * 100:.1f}%" if not pd.isna(rate) else "n/a"
+            return dd.link(text, f"Documents and clean flag: {label}", rows,
+                           DOC_COLUMNS_BASE + ["critical_mismatches", "clean"]), rate
+
+        def hidden_link(frame: pd.DataFrame, label: str) -> str:
+            rows = frame[frame["level"] == "header"]
+            return dd.link(f"{len(rows):,}", f"Wrong header fields hidden by agreement: {label}",
+                           rows, ["doc_id", "field", "extracted_value", "filed_value",
+                                  "gold_value", "reason", "reason_gold", "confidence"])
+
+        bars = []
+        for label, evaluation, css in [
+            ("agreement with the original filing", ev, "story-pass"),
+            (
+                ("agreement if reviewers accept wrong pre-fill "
+                 f"({scenario.acceptance_probability * 100:.0f}% assumed)"),
+                scenario.evaluation,
+                "story-risk",
+            ),
+            ("agreement with the synthetic truth", gold, "story-truth"),
+        ]:
+            link, rate = clean_link(evaluation, label)
+            width = 0 if pd.isna(rate) else rate * 100
+            bars.append(
+                f'<div class="story-compare"><div class="story-compare-label">{esc(label)}</div>'
+                f'<div class="story-compare-track"><div class="story-compare-fill {css}" '
+                f'style="width:{width:.1f}%"></div></div><strong>{link}</strong></div>'
+            )
+        agreement_content = (
+            '<p class="story-kicker">SYNTHETIC SCENARIO &middot; SAME EXTRACTION, DIFFERENT FILING</p>'
+            '<p class="story-data-label">Documents with no important mismatch, by what we compare against</p>'
+            + "".join(bars)
+            + '<p class="story-caption"><strong>Agreement went up while the filing got worse.</strong> '
+            'Wrong values hidden by agreement: '
+            + hidden_link(extras.hidden_errors, "original filing") + ' &rarr; '
+            + hidden_link(scenario.hidden_errors, "hypothetical filing")
+            + '. The extraction did not change; reviewers copying its mistakes made the filing '
+            'look more like it. The acceptance rate is an assumption, not observed reviewer behaviour.</p>'
+        )
+
+    return (
+        '<section class="story-section">'
+        '<div class="story-heading"><div><p class="story-kicker">THE QUESTION</p>'
+        '<h2>What does the person reviewing this declaration need to be warned about?</h2></div>'
+        '<p>Today a person reviews every declaration before it is filed. This report gathers evidence '
+        'about the extraction they are shown. It does not declare a document correct.</p></div>'
+        '<p class="story-takeaway"><span>The takeaway</span>A confidence score can only describe what the '
+        'extractor found. It cannot point a reviewer to a line the extractor left out, and agreement '
+        'with the filing cannot prove the reviewer caught it.</p>'
+        '<div class="story-grid">'
+        f'<div class="story-panel"><h3>1. Follow one document</h3>{case_content}</div>'
+        f'<div class="story-panel"><h3>2. Agreement is not correctness</h3>{agreement_content}</div>'
+        '</div>'
+        '<div class="story-routing"><span class="story-kicker">AFTER FILING: A POLICY TO VALIDATE</span>'
+        '<div class="story-routes">'
+        '<div class="route route-agree"><strong>Extraction agrees with filing</strong><span>Not proof: it may be a shared error. Keep some in a random independent audit</span></div>'
+        '<div class="route route-differs"><strong>Extraction differs from filing</strong><span>Investigate which side is wrong</span></div>'
+        '<div class="route route-unknown"><strong>Not enough evidence</strong><span>Report as unresolved; never count it as correct</span></div>'
+        '</div><p class="story-caption">Human review stays in place. These lanes describe how to treat the evidence '
+        'afterwards; they are a proposal for the team to validate, not an implemented workflow. '
+        'Only an independent check of the source (blind audit) can estimate what extraction and reviewer both missed.</p>'
+        '</div></section>'
+    )
+
+
+def _future_whatif_picture(ev: Evaluation, dd: _Drilldowns, synthetic: bool = False) -> str:
+    """One-picture version of the straight-through what-if at the threshold
+    nearest 0.70, shown above the full threshold table."""
+    comparisons = ev.comparisons
+    # Use the configured threshold nearest 0.70, and display the actual value.
+    straight = ev.straight_through
+    risk_content = '<p>No confidence-threshold results are available for this run.</p>'
+    if not straight.empty and len(ev.doc_summary):
+        index = (straight["threshold"] - 0.70).abs().idxmin()
+        policy = straight.loc[index]
+        threshold = float(policy["threshold"])
+        accepted = ev.doc_summary[
+            ev.doc_summary["min_critical_confidence"].notna()
+            & (ev.doc_summary["min_critical_confidence"] >= threshold)
+        ]
+        escaped = accepted[accepted["critical_mismatches"] > 0]
+        accepted_without_mismatch = len(accepted) - len(escaped)
+        review_docs = ev.doc_summary[~ev.doc_summary.index.isin(accepted.index)]
+        not_accepted = len(review_docs)
+        total = len(ev.doc_summary)
+        no_mismatch = accepted[accepted["critical_mismatches"] == 0]
+        critical_nc_docs = set(comparisons.loc[
+            (comparisons["tier"] == ev.critical_tier)
+            & (comparisons["status"] == NOT_COMPARABLE), "doc_id"])
+        unchecked = accepted[accepted["doc_id"].isin(critical_nc_docs)]
+        segments = [
+            ("above threshold · no mismatch found vs filing (not verified)",
+             accepted_without_mismatch, "story-pass"),
+            ("above threshold · mismatch found vs filing", len(escaped), "story-risk"),
+            ("below threshold · would go to review (review is what happens today)",
+             not_accepted, "story-review"),
+        ]
+        bar = "".join(
+            f'<div class="story-bar-segment {css}" style="width:{count / total * 100:.2f}%" '
+            f'title="{count} {esc(label)}"></div>'
+            for label, count, css in segments if count
+        )
+        legend_frames = [
+            no_mismatch,
+            escaped,
+            review_docs,
+        ]
+        legend_titles = [
+            f"No tier-{ev.critical_tier} mismatch found at threshold {threshold:.2f}",
+            f"Tier-{ev.critical_tier} mismatch found at threshold {threshold:.2f}",
+            f"Documents below threshold {threshold:.2f} (would go to review)",
+        ]
+        legend = "".join(
+            f'<div class="story-legend-item"><i class="{css}"></i>'
+            f'<strong>{dd.link(f"{count:,}", title, frame, DOC_COLUMNS_BASE + ["critical_mismatches", "min_critical_confidence"])}</strong> '
+            f'{esc(label)}</div>'
+            for (label, count, css), frame, title
+            in zip(segments, legend_frames, legend_titles, strict=True)
+        )
+        source = ("Generated demo data" if synthetic else "Extraction run")
+        data_label = (
+            f'<p class="story-data-label">{source} &middot; {total:,} documents &middot; '
+            'compared against filed records, not against verified answers</p>'
+        )
+        nc_frame = ev.doc_summary[ev.doc_summary["doc_id"].isin(critical_nc_docs)]
+        nc_columns = DOC_COLUMNS_BASE + [
+            "critical_mismatches", "not_comparable", "min_critical_confidence"]
+        unchecked_note = (
+            '<p class="story-caption"><strong>Missing fields are caught; missing lines are not.</strong> '
+            + dd.link(f"{len(nc_frame):,}",
+                      f"Documents with a tier-{ev.critical_tier} field that could not be compared",
+                      nc_frame, nc_columns)
+            + f' documents had a tier-{ev.critical_tier} field that could not be compared; '
+            + dd.link(f"{len(unchecked):,}",
+                      f"Above threshold {threshold:.2f} despite an uncomparable tier-{ev.critical_tier} field",
+                      unchecked, nc_columns)
+            + ' of them cleared the threshold: a missing critical score blocks automatic acceptance. '
+            'A dropped goods line leaves no score behind, so nothing blocks it.</p>'
+        )
+        risk_content = (
+            f'<p class="story-kicker">IF WE SET A TEST THRESHOLD OF {threshold:.2f}</p>'
+            + data_label +
+            f'<div class="story-bar" role="img" aria-label="{accepted_without_mismatch} accepted documents had no tier mismatch found, '
+            f'{len(escaped)} accepted documents had a tier mismatch, {not_accepted} below threshold">{bar}</div>'
+            f'<div class="story-legend">{legend}</div>'
+            + unchecked_note +
+            f'<p class="story-caption">“Mismatch found” means a tier-{ev.critical_tier} difference from the filed record. '
+            '“No mismatch found” is not the same as verified: some fields cannot be compared, and filed records '
+            'can be wrong or amended. A reviewer can also accept the same wrong value, which hides it. '
+            'These are warning signals, not confirmed extraction errors.</p>'
+            + dd.link("Open threshold results",
+                      f"Threshold {threshold:.2f}: pass/review outcomes",
+                      ev.doc_summary, DOC_COLUMNS_BASE + [
+                          "critical_mismatches", "min_critical_confidence", "clean",
+                      ])
+        )
+
+    return f'<div class="story-whatif">{risk_content}</div>'
 
 
 def _escaped_rate_at(evaluation: Evaluation, threshold: float) -> float:
@@ -662,7 +954,7 @@ def _alignment_section(ev: Evaluation, dd: _Drilldowns) -> str:
     )
 
 
-def _straight_through_section(ev: Evaluation, dd: _Drilldowns) -> str:
+def _straight_through_section(ev: Evaluation, dd: _Drilldowns, synthetic: bool = False) -> str:
     ds = ev.doc_summary
     confidence = ds["min_critical_confidence"]
     body = []
@@ -704,7 +996,7 @@ def _straight_through_section(ev: Evaluation, dd: _Drilldowns) -> str:
         "exist: a document whose extraction silently dropped a goods item still "
         "sails through, because the missing line has no score to be low.  That "
         "is how confidence gates fail in real life.</p>"
-        f"{table}</section>"
+        f"{_future_whatif_picture(ev, dd, synthetic)}{table}</section>"
     )
 
 
@@ -980,6 +1272,64 @@ a.drill { color: var(--accent); text-decoration: underline dotted; cursor: point
 .caveats { border-left: 4px solid #b45309; }
 .caveats li { margin: .4rem 0; max-width: 85ch; }
 #drilldowns h2 { margin-top: 2rem; }
+.story-section { padding: clamp(1.1rem, 3vw, 2rem); border-top: 4px solid var(--accent); }
+.story-heading { display: flex; justify-content: space-between; align-items: end; gap: 1.5rem; margin-bottom: 1.2rem; }
+.story-heading h2 { font-size: clamp(1.35rem, 3vw, 2rem); line-height: 1.2; max-width: 22ch; }
+.story-heading > p { max-width: 34ch; margin: 0; }
+.story-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; }
+.story-panel { border: 1px solid var(--line); border-radius: 8px; padding: 1rem; min-width: 0; }
+.story-panel h3 { margin-bottom: 1rem; }
+.story-kicker { color: var(--muted); font-size: .72rem; font-weight: 750; letter-spacing: .09em; margin: 0 0 .7rem; }
+.story-pair { display: grid; grid-template-columns: minmax(0, 1fr) 76px minmax(0, 1fr); gap: .55rem; align-items: stretch; margin: .7rem 0; }
+.story-item { border: 1px solid var(--line); border-radius: 7px; padding: .75rem; min-width: 0; background: #fff; }
+.story-item > strong { display: block; font-size: .88rem; margin-bottom: .5rem; }
+.story-facts { color: var(--muted); font-size: .8rem; overflow-wrap: anywhere; }
+.story-facts span { display: inline-flex; flex-direction: column; margin: 0 .7rem .45rem 0; }
+.story-facts small { color: var(--muted); font-size: .68rem; }
+.story-link { display: flex; align-items: center; justify-content: center; align-self: center; color: #17603a; font-size: .62rem; font-weight: 800; letter-spacing: .04em; }
+.story-link::before, .story-link::after { content: ""; height: 2px; flex: 1; background: #59a878; }
+.story-link { gap: .25rem; }
+.story-unmatched { color: #9a3412; }
+.story-unmatched::before, .story-unmatched::after { background: #d97745; }
+.story-alert { border-color: #e6a483; background: #fff8f4; }
+.story-empty { border-style: dashed; color: var(--muted); background: #fafbfc; }
+.story-caption { font-size: .8rem; margin: .8rem 0; }
+.story-bar { height: 1.3rem; display: flex; overflow: hidden; border-radius: 6px; background: #eef0f3; margin: 1rem 0 .6rem; }
+.story-bar-segment { min-width: 2px; }
+.story-pass { background: #7fa9a6; }
+.story-risk { background: #d65b42; }
+.story-review { background: #d7dce3; }
+.story-truth { background: #5b6573; }
+.story-compare { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) 3.5rem; gap: .6rem; align-items: center; margin: .5rem 0; font-size: .85rem; }
+.story-compare-track { height: 12px; border-radius: 6px; background: #eef0f3; overflow: hidden; }
+.story-compare-fill { height: 100%; }
+.story-whatif { max-width: 46rem; margin: 1rem 0 1.4rem; }
+.story-takeaway { margin: 0 0 1.2rem; padding: .8rem 1rem; border-left: 4px solid #d65b42; background: #fff6f3; font-size: 1.1rem; font-weight: 600; }
+.story-takeaway span { display: block; font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; color: #9a3d2b; }
+.story-data-label { margin: -.2rem 0 .6rem; font-size: .8rem; color: #5b6573; }
+.story-legend { display: grid; gap: .4rem; }
+.story-legend-item { display: flex; align-items: baseline; gap: .45rem; color: var(--muted); font-size: .85rem; }
+.story-legend-item strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+.story-legend-item i { width: .65rem; height: .65rem; border-radius: 2px; flex: 0 0 auto; }
+.story-routing { border-top: 1px solid var(--line); margin-top: 1.2rem; padding-top: 1rem; }
+.story-routes { display: grid; grid-template-columns: repeat(3, 1fr); gap: .7rem; }
+.route { display: flex; flex-direction: column; gap: .2rem; border-radius: 7px; padding: .8rem; border-left: 4px solid; }
+.route strong { font-size: .9rem; }
+.route span { color: var(--muted); font-size: .8rem; }
+.route-agree { background: #f0f8f2; border-color: #50a878; }
+.route-differs { background: #fff4ef; border-color: #d65b42; }
+.route-unknown { background: #f4f5f7; border-color: #8a94a2; }
+@media (max-width: 800px) {
+  .story-grid { grid-template-columns: 1fr; }
+  .story-heading { align-items: start; flex-direction: column; gap: .4rem; }
+}
+@media (max-width: 520px) {
+  body { padding: 1rem .7rem 4rem; }
+  .story-pair { grid-template-columns: 1fr; }
+  .story-link { min-height: 1.1rem; }
+  .story-link::before, .story-link::after { max-width: 3rem; }
+  .story-routes { grid-template-columns: 1fr; }
+}
 """
 
 _JS = """
@@ -1317,11 +1667,13 @@ def build_report(
     extras = extras or ReportExtras()
     dd = _Drilldowns()
     sections = [
+        _story_section(evaluation, dd, extras),
         _headline(evaluation, dd, extras),
         _regimes_section(evaluation, extras, dd),
         _synthetic_review_section(evaluation, extras, dd),
         _alignment_section(evaluation, dd),
-        _straight_through_section(evaluation, dd),
+        _straight_through_section(
+            evaluation, dd, synthetic=extras.gold_evaluation is not None),
         _leading_indicators_section(evaluation, extras, dd),
         _calibration_section(evaluation, dd),
         _confidence_quality_section(extras, dd),

@@ -108,6 +108,16 @@ def test_report_builds_with_all_extras(pipeline, tmp_path):
     )
     path = report.build_report(proxy_ev, validity_df, tmp_path / "report.html", extras)
     html = path.read_text(encoding="utf-8")
+    assert 'class="story-section"' in html
+    assert "ONE DOCUMENT" in html
+    assert "AFTER FILING: A POLICY TO VALIDATE" in html
+    assert "The takeaway" in html
+    assert "What does the person reviewing this declaration need to be warned about?" in html
+    assert "Agreement is not correctness" in html
+    assert "Today a person reviews every declaration" in html
+    assert "no mismatch found vs filing (not verified)" in html
+    assert "Missing fields are caught; missing lines are not." in html
+    assert html.index('class="story-whatif"') > html.index("Future what-if: confident documents")
     assert "Three ways to score the same extraction" in html
     assert "Is the confidence score any good?" in html
     assert html.count('class="drilldown"') == html.count('class="drill"')
@@ -221,6 +231,11 @@ def test_demo_writes_traceable_synthetic_review_report(tmp_path):
         str(int((simulated_hidden["level"] == "header").sum())),
     ]
     assert labels == expected_rates + expected_hidden
+    story_start = html.index('<section class="story-section">')
+    story = html[story_start:html.index("</section>", story_start)]
+    agreement = story[story.index("Agreement is not correctness"):story.index("AFTER FILING")]
+    story_labels = re.findall(r'<a class="drill" href="#drill-\d+">([^<]+)</a>', agreement)
+    assert story_labels == expected_rates + expected_hidden
     assert "not an observation of reviewers" in section
     assert "not a recommendation to remove current human review" in html
     assert "can only be lower" not in html

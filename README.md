@@ -142,6 +142,274 @@ python run_demo.py --seed 42 --synthetic-review-acceptance 1 --no-open
 Each run replaces the previous output in the chosen directories.  Use
 different `--data-dir` and `--out-dir` values to keep both runs.
 
+## Five minutes: what the report opens with
+
+This is the short version of the lesson in
+[the 20-minute walkthrough](#a-first-team-walkthrough-about-20-minutes),
+built around the first screen of the report.  Today a person reviews
+every declaration the extraction pre-fills, then files it.  The report
+opens with the question that matters in that workflow: **what does the
+reviewer need to be warned about?**
+
+If you remember one thing: **a confidence score can only describe what
+the extractor found.  It cannot point a reviewer to a line the extractor
+left out, and agreement with the filing cannot prove the reviewer caught
+it.**
+
+To see the example:
+
+```bash
+python run_demo.py --docs 150 --seed 7 --no-open
+```
+
+Open `out/report.html`.  Every number on the first screen is a link;
+click it to see the rows behind it.  All figures below come from this
+**generated** run (`seed=7`, 150 documents) and are not evidence about
+real reviewers or real accuracy.
+
+**Panel 1: one document.**  For `DOC-000005`, the tool found one goods
+line, but the filed record has two.  The comparison pairs the extracted
+line with the most similar filed line and shows the other as missing.
+The tool's lowest confidence on an important field is `0.751`, so
+nothing in the scores would point a reviewer at the gap: a line that was
+never extracted has no score.  The generated answer key confirms that a
+line was dropped; in real life the filing alone cannot prove it is
+complete.
+
+**Panel 2: agreement is not correctness.**  The report's synthetic
+scenario ("Synthetic demonstration: when review copies an error") keeps
+the extraction fixed and assumes a hypothetical reviewer accepts each
+wrong pre-filled header value with probability 0.5:
+
+| Compared against | Documents with no important mismatch |
+|---|---|
+| the original filing | 58.7% |
+| a filing where reviewers accepted wrong pre-fill | 62.0% |
+| the synthetic truth | 60.7% |
+
+Wrong values hidden by agreement rise from 0 to 14.  **Agreement went up
+while the filing got worse.**  The acceptance probability is a teaching
+assumption, not observed behaviour.
+
+**Below the panels: what to do after filing.**  Three lanes describe a
+proposal, not an implemented workflow: *extraction agrees with the
+filing* (not proof; it may be a shared error, so keep some in a random
+independent audit), *extraction differs* (investigate which side is
+wrong), and *not enough evidence* (report as unresolved; never count it
+as correct).  Human review stays in place throughout.
+
+**Lower down: a future what-if.**  The section "Future what-if: confident
+documents without review" opens with a picture of one hypothetical
+policy: skip review for every document whose important fields all score
+at least 0.70.  It is there to show why confidence alone could never
+justify that, not to propose it.  Skip it in a first session.
+
+| Segment (threshold 0.70) | Count | What it does **not** mean |
+|---|---|---|
+| above threshold · no mismatch found vs filing (not verified) | 55 | Not "correct": the filing can be wrong, a reviewer may have accepted the same wrong value, and some fields may not have been compared |
+| above threshold · mismatch found vs filing | 19 | Not a confirmed extraction error: the filing may be the side that is wrong |
+| below threshold · would go to review | 76 | Review is what happens today for all 150 |
+
+That picture also shows a useful contrast: **missing fields are caught;
+missing lines are not.**  25 documents had an important field that could
+not be compared, and none of them cleared the threshold, because a
+missing critical score blocks acceptance (`_min_critical_confidence` in
+`evaluate.py`).  A dropped goods line leaves no score behind, so nothing
+blocks it, which is exactly what happened to `DOC-000005`.
+
+**How to present it (about 3 minutes).**  Open with the takeaway
+sentence.  Show `DOC-000005`: the missing filed line and the 0.751
+confidence.  Show panel 2 and say plainly that it is generated data with
+an assumed reviewer behaviour.  Finish on the three lanes and call them
+what they are: a proposal for the team to validate.  If anyone doubts a
+number, click it and show the rows.
+
+The report's "clean" count means no important differences were found
+against the chosen reference.  It does not mean every field was verified:
+fields the evaluator could not compare are counted separately and do not,
+by themselves, make a document unclean.
+
+**A fast first step:** choose one kind of declaration and agree with a
+customs expert on a few important fields.  Have an independent reviewer
+check a small random sample against the original documents without
+seeing the extraction or the filing, then compare that answer key with
+both.  This project demonstrates the comparison side of that loop with
+ordinary Python tools; a team can learn from a narrow slice before
+building a larger platform.  That is not a promise of a delivery date or
+production readiness.  The roadmap in
+[Where this prototype stops](#where-this-prototype-stops-and-the-team-begins)
+lists what is still needed.
+
+Before trusting the result, ask four people to check the same example:
+Would a reviewer find the warning useful?  Does the analyst think the
+sample supports the claim?  Does the customs expert agree on what
+"correct" means?  Can a skeptical reviewer find a wrong pairing or
+misleading label?  The report is useful only when its evidence survives
+those questions.
+
+## Go deeper: trace one document to its evidence
+
+The useful skill is not naming the layers; it is being able to start with
+an input, explain each transformation, and say exactly what a resulting
+number does and does not establish. Work through one generated document
+before reading the aggregate report:
+
+This is the same **synthetic teaching run**, not evidence about production
+accuracy. For this seed, `DOC-000005` is a compact example. In
+`data/extracted_acme.csv`, Acme emits one goods row: item 1, HS
+`8528721000`, value `20891.70`. In `data/filed_customs_ledger.csv`, the
+same document has two rows; item 2 is HS `8523512000`, value `33286.52`.
+The generator's `data/gold_truth.csv` also contains both items. The
+example therefore demonstrates a known synthetic dropped-item case; a
+real filing-only evaluation could not infer that the filing is complete
+or correct just from the two-row comparison.
+
+Trace it in this order:
+
+1. **Source to canonical record.** [`readers/acme_csv.py`](readers/acme_csv.py)
+   groups repeated flat-CSV rows by `document_no`, maps their columns, and
+   parses values into [`CanonicalRecord` and `CanonicalItem`](canonical.py).
+   The reader preserves the date text; interpretation belongs to the
+   comparator. The [`customs_ledger` reader](readers/customs_ledger.py)
+   maps the filed export to the same shape. This common shape lets later
+   code compare records without knowing their source format; it does not
+   prove either reader's mapping is faithful to a real source system.
+2. **Pair goods, don't join by line number.**
+   [`alignment.py`](alignment.py) scores candidate item pairs using HS
+   prefix, value, origin, and quantity, then greedily accepts the best
+   available pairs above the configured score floor. Item numbers are
+   context, not identity. In this example item 1 pairs with filed item 1;
+   filed item 2 has no remaining partner. The output explains the accepted
+   pairing in `alignment_basis`. In [`out/field_comparisons.csv`](out/field_comparisons.csv),
+   filter `doc_id` to `DOC-000005`: the `structure` / `missed_item` row
+   records the unpaired filed item as a tier-1 mismatch. The row can say
+   “dropped or merged line?” because alignment alone cannot distinguish
+   those causes. Here the generator's synthetic truth sidecar lets us
+   check that it was dropped.
+3. **Compare within pairs and retain reasons.**
+   [`evaluate.py`](evaluate.py) applies the configured comparators to
+   header fields and paired item fields, then adds explicit rows for
+   unmatched items. A normal item row records both item numbers, the
+   alignment score and basis, values, verdict, reason, comparator and
+   comparator version. For example, the paired item-value row in this
+   synthetic document is a match under the configured tolerance, despite
+   the extracted `20891.70` and filed `20891.10` not being identical.
+   The rule and its tolerance live in [`field_tiers.yaml`](field_tiers.yaml);
+   a “match” means this configured comparator accepted the values, not
+   that a domain authority certified them.
+4. **Roll up, then drill back down.** `out/doc_summary.csv` shows
+   `DOC-000005` has 1 extracted item, 2 filed items, 1 pair, 1 missed item,
+   1 critical mismatch and `clean=False`. The report headline is derived
+   from these document outcomes; its links open the contributing rows.
+   [`report.py`](report.py) builds those drill-downs, while
+   [`tests/test_end_to_end.py`](tests/test_end_to_end.py) exercises the
+   generator-to-report path and checks that every report link has a
+   drill-down. For more than 100 drill rows, the page is capped; the CSV
+   remains the complete evidence.
+
+### Think through what each score means
+
+For each measure, ask three questions: What population and label does it
+use? What kind of error is outside its view? What operational decision
+could this evidence justify?
+
+| Choice | What it measures and why it helps | What it misses; decision it can support |
+|---|---|---|
+| **Truth / gold** | Agreement with a record intended to represent what the source document said. The synthetic generator can provide this answer key so we can inspect failure modes and compare proxy scores with known truth. | Synthetic truth tests the harness against the generator's own assumptions, not messy real paperwork. In production, a carefully defined, independently human-adjudicated sample is needed. It can estimate real extraction quality only for the sampled population and adjudication rules. |
+| **Filed / proxy** | Agreement with the downstream record that is available at scale. It is an actionable production signal when no complete answer key exists. | The filing is an outcome of a review that saw the extraction, so it is not independent: a reviewer who accepts a wrong pre-filled value makes the filing repeat it, hiding the error. A legitimate post-filing amendment can look like an extraction error. It supports consistency monitoring and choosing what to investigate—not a claim of correctness. |
+| **Blind checks** | Validity rules and confidence signals that require no reference answer. They can flag malformed or internally inconsistent records early. | A plausible, valid-looking fabrication may pass every check, and no warning is not evidence of correctness. Use these signals for triage and monitoring, not as a substitute for reference comparison or audit. |
+| **Item alignment** | A content-based, auditable hypothesis about which extracted and filed goods lines correspond. It avoids treating independently assigned line numbers as stable IDs and allows whole-line omissions to appear as structure rows. | The greedy policy is not globally optimal; similar items, merges, and the score floor can produce a wrong or ambiguous pairing. The [`alignment` tests](tests/test_alignment.py) verify chosen examples, not real-world pairing accuracy. Use the basis and source records to audit consequential pairings; validate the policy on independently labeled documents before relying on its rates. |
+| **Clean document rate** | Share of joined documents with zero **mismatch-status** rows at the configured critical tier. It reflects the operational fact that a document may need attention if any critical field or line is wrong. | It weights each document equally and hides error count and severity within a document; inspect field and structure breakdowns to diagnose. Also, the implementation's clean flag counts mismatches, not `not_comparable` rows. A critical value the comparator cannot judge can therefore remain visible in the separate `not_comparable` count without making the document unclean. Confirm whether that is the intended operational definition before using “clean” as an acceptance gate. |
+| **Uncertainty ranges** | The document bootstrap shows how the headline rate varies under resampling; Wilson intervals show uncertainty for simple proportions and small slices. They discourage treating a finite-sample percentage as exact. | These ranges do not repair biased labels, non-representative sampling, dependence, distribution shift, or systematic evaluator error. Overlapping ranges are not themselves a formal test of a difference. Use them to communicate sampling precision, alongside a sampling/design review. |
+| **Confidence quality** | Calibration asks whether scores match observed correctness; Brier summarizes probability error; AUROC asks whether scores rank correct cases above incorrect ones. Per-field and gold/proxy views expose failures hidden by pooled metrics. | The calculations use only rows with a confidence and a definite match/mismatch verdict: unmatched structural items and not-comparable rows are excluded. A dropped line has no confidence to score. A confidence threshold can support a cautious review policy only after validating the gate's escaped-error rate on representative, independently labeled data; confidence alone cannot prove safety. |
+| **Audit sample** | Randomly grading documents gives an estimate of the true clean rate and an interval whose width reflects the amount of human review. | The estimate assumes a genuine random sample and consistent grading; targeted samples need a designed weighting method. The demo's [`audit_sample_estimate`](uncertainty.py) samples a synthetic gold summary to illustrate the arithmetic; it does not implement a production audit queue, human adjudication workflow, or non-random-sample correction. Use the method to plan audit volume, not to claim that the demo's sampled labels were human-verified. |
+
+### Uncertainty is more than an error bar
+
+The framework has several signals that help explain *why* a result may be
+uncertain, but they describe different problems:
+
+- **The extraction may be unsure.** The tool's field-confidence scores can
+  be checked against observed outcomes with the calibration table and
+  confidence-quality summaries. These scores are useful only to the extent
+  that they have been validated; they cannot score a line that was never
+  extracted.
+- **The comparison may be inconclusive.** A comparator can return
+  `not_comparable` when values are missing or cannot be parsed. The
+  aligner also records a reason for accepted pairs and leaves items
+  unmatched when no candidate clears its configured floor. An unmatched
+  item is evidence of a structural difference, but not proof of whether
+  extraction dropped/added a line or the pairing policy failed.
+- **The reference may be wrong or changed.** The filed record is available
+  at scale but can contain errors or later amendments, and it can repeat
+  an extraction error that the reviewer accepted. The demo compares
+  proxy and generated-truth results to show how those labels can disagree,
+  and the synthetic review scenario shows agreement rising as copied
+  errors increase; it does not connect to production amendment history.
+- **The measured rate may wobble.** The bootstrap and Wilson intervals
+  describe sampling variation. They do not account for systematic
+  mislabeling, a biased sample, a flawed comparator, or changed production
+  data.
+
+These signals do not combine automatically into a complete “uncertainty
+score,” and this prototype does not implement a production review queue.
+In particular, `clean` currently means **no tier-1 mismatch was detected**;
+a tier-1 `not_comparable` row is counted separately and does not make the
+document unclean. So “clean” is not the same as “verified,” and this
+headline alone must not be used to pass documents without review. Before
+using the measure operationally, define how unresolved comparisons affect
+the decision—for example, route them to review rather than treating them
+as a pass—and test that policy on independently adjudicated examples.
+
+To reduce repeated expert review without pretending uncertainty is gone,
+keep two loops distinct: route visible disagreements and insufficient
+evidence for targeted investigation; also randomly audit some apparently
+clean cases to estimate unseen errors and detect drift. If audits
+intentionally oversample risky cases, retain the sampling probabilities
+and use an appropriate weighted estimate before reporting a population
+rate. The current audit code demonstrates a simple random-sample interval
+on synthetic labels; it does not implement either production workflow.
+
+These are different kinds of evidence. A unit test can show that a
+comparator or aligner behaves as coded for a fixture; the end-to-end test
+can show that the layers connect and a report renders. Neither verifies
+that a customs rule, field tier, tolerance, alignment policy, or “clean”
+definition is right for a real filing decision. Those assumptions need
+review by customs/domain experts and validation against representative
+documents with an independent adjudication protocol. Preserve the
+adjudication and amendment provenance so disagreements can be interpreted,
+not silently labeled as extraction errors.
+
+### Exercise: defend one headline
+
+Using the run above, inspect `data/extracted_acme.csv`,
+`data/filed_customs_ledger.csv`, the `DOC-000005` rows in
+`out/field_comparisons.csv`, its row in `out/doc_summary.csv`, and the
+linked table in `out/report.html`. Write a short evidence chain answering:
+
+- Which extracted and filed items were paired, and which row shows the
+  unpaired item? What does the alignment basis establish—and what does it
+  leave uncertain?
+- Why is this document not clean under the configured rule? Would a
+  confidence highlight have warned the reviewer? In the future what-if,
+  would a high-confidence threshold necessarily hold it for review? Its
+  minimum critical confidence is `0.751`: a `0.70` threshold would let it
+  through, while `0.80` would not. Verify those outcomes in `out/doc_summary.csv` and
+  `out/straight_through.csv` rather than guessing from the existence of an
+  error.
+- Which label makes this example's dropped-item interpretation checkable?
+  Could the same conclusion be drawn from the filing alone?
+
+**Check your answer:** cite the source rows and the comparison/summary
+rows; distinguish the algorithm's pairing from the generator's synthetic
+truth; state the tier-1 mismatch that drives `clean=False`; explain that a
+confidence scores exist only on extracted fields, so neither a reviewer
+highlight nor a threshold sees a missing item;
+and do not generalize this one synthetic document to production quality.
+As a team exercise, have a second person reproduce the chain from the
+files and have a customs/domain reviewer assess whether the assumptions
+would be acceptable for the intended real workflow.
+
 ## What the layers are, and why they are separate
 
 ```
