@@ -1,10 +1,10 @@
 """Generate a few thousand paired (extracted, filed) multi-item declarations
 with realistic, deliberately injected error patterns.
 
-The generator knows the ground truth; the harness never sees it.  The one
-piece of truth written to disk is the amendments sidecar
-(data/amendments_truth.csv): values the FILED side legitimately changed
-after filing (revaluations, corrected counts, reclassifications).  Those
+The generator knows the ground truth; the harness never reads truth files.
+The amendments sidecar (data/amendments_truth.csv) records values the
+FILED side legitimately changed after filing (revaluations, corrected
+counts, reclassifications).  Those
 show up to the harness as mismatches that are NOT extraction errors --
 exactly the ambiguity a real deployment faces.  evaluate.py never reads
 that file; it exists so a human can check how much of the measured error
@@ -34,8 +34,9 @@ Errors come in three styles, and the style column in the sidecar matters:
   - a different but in-tariff HS code from the same chapter (right format,
     in the tariff list, same supplementary unit)
   - a different but real origin country
-  No blind signal exists for these; only the proxy or an audited gold
-  sample can find them.
+  No blind signal exists for these.  The proxy detects a difference only
+  when the filing does not repeat the error; an independent audit can
+  detect errors shared by extraction and filing.
 
   STRUCTURAL (the reason this harness is multi-item):
   - a dropped goods item (the last line falls off a page break)
