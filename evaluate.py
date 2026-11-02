@@ -496,11 +496,11 @@ def _straight_through(doc_summary: pd.DataFrame, thresholds: list[float]) -> pd.
     with it?
 
     Two honesty notes.  "Escaped errors" are documents that disagree with
-    what was eventually filed, so legitimate post-filing amendments count
-    as escapes -- treat the rate as an upper bound.  And the gate sees only
-    per-field confidence: a document whose extraction silently DROPPED a
-    goods item still auto-accepts (the missing line has no score to be low),
-    which is exactly how a real confidence gate fails."""
+    what was eventually filed: amendments can create disagreements while
+    shared errors remain hidden, so this is not a bound on true errors.
+    And the gate sees only per-field confidence: a document whose extraction
+    silently DROPPED a goods item still auto-accepts (the missing line has no
+    score to be low), which is exactly how a real confidence gate fails."""
     n_docs = len(doc_summary)
     confidence = doc_summary["min_critical_confidence"]
     rows = []
@@ -614,12 +614,12 @@ def proxy_disagreement(
     """Split the proxy's verdicts by what the gold standard says.
 
     Returns (false_alarms, hidden_errors):
-      false_alarms   mismatch vs filed but match vs gold -- the proxy's
-                     noise, overwhelmingly post-filing amendments.
+      false_alarms   mismatch vs filed but match vs gold -- a difference in
+                     the reference, which can include post-filing amendments.
       hidden_errors  match vs filed but mismatch vs gold -- extraction and
-                     filing wrong in the same way; near zero here, and the
-                     population that grows once auto-accepted extractions
-                     start being filed verbatim (the feedback loop).
+                     filing wrong in the same way.  A reviewer accepting a
+                     wrong pre-filled value can cause this even when every
+                     document receives human review.
 
     Joins field rows on the extracted side's identity (doc, level, field,
     extracted item number), which both regimes share; structure rows have

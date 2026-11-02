@@ -38,6 +38,16 @@ DOC_COLUMNS_BASE = ["doc_id", "country", "source_system"]
 
 
 @dataclass
+class SyntheticReviewScenario:
+    """Precomputed synthetic-only demonstration; not a real reviewer study."""
+
+    acceptance_probability: float
+    simulation_version: str
+    evaluation: Evaluation
+    hidden_errors: pd.DataFrame
+
+
+@dataclass
 class ReportExtras:
     """Optional analyses beyond the core proxy evaluation.  Every field may
     be None; the corresponding report section simply does not render."""
@@ -53,6 +63,7 @@ class ReportExtras:
     gold_clean_rate_ci: tuple[float, float] | None = None  # gold, bootstrap
     breakdown_ci: pd.DataFrame | None = None       # Wilson CI per country x system
     extra_notes: list[str] = field(default_factory=list)
+    synthetic_review: SyntheticReviewScenario | None = None
 
 
 def esc(value) -> str:
@@ -275,14 +286,14 @@ def _regimes_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> s
         disagreement = (
             "<p>Where the two scorings disagree, one of them is misleading us. "
             f"{fa_link}: the tool was actually right, but the filed record was "
-            "changed after filing (an amendment), so scoring against the filing "
-            "wrongly blames the tool.  "
+            "different &mdash; for example, changed after filing &mdash; so "
+            "scoring against the filing wrongly blames the tool.  "
             f"{hidden_link}: the tool agreed with the filing and both were wrong "
-            "&mdash; a mistake no filing-based check can ever see.  That count is "
-            "near zero today because people still file from the paperwork, not "
-            "from the tool's output.  The moment auto-accepted extractions start "
-            "being filed as-is, it grows silently &mdash; and agreement with the "
-            "filing stops meaning anything for those documents.</p>"
+            "&mdash; a mistake comparison with that filing cannot see.  This "
+            "can happen even when a person reviews every document, if they "
+            "accept a wrong pre-filled value.  The baseline synthetic filing "
+            "starts from truth, so it does not measure real reviewer behaviour.  "
+            "These counts exclude unmatched whole items.</p>"
         )
 
     audit = ""
@@ -310,10 +321,12 @@ def _regimes_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> s
             "<p>In the real world nobody has the truth for every document.  What "
             "you can do is pick documents at random, have a person check just "
             "those against the paperwork, and let that sample speak for the "
-            "whole.  (Here the person is played by the truth file.)  The smaller "
+            "whole.  In the synthetic demo, generated truth plays the person.  "
+            "The smaller "
             "the sample, the wider the range of clean rates it could honestly "
             "mean &mdash; that width is the price list for human checking: to "
-            "halve it, check four times as many documents.  The true rate is "
+            "halve it, check four times as many documents.  The rate against "
+            "the available gold reference is "
             f"{_pct(gold.clean_document_rate)}; each range below should usually "
             "contain it, though even a 95% range misses about one run in twenty "
             "&mdash; which is part of what it teaches.</p>"
@@ -325,9 +338,9 @@ def _regimes_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> s
         "<p>To say the tool got something wrong, you need something to compare "
         "against &mdash; and there are three candidates, each with a catch.  "
         "<strong>The truth</strong> (we call it gold): what the paperwork really "
-        "said.  We have it here only because this data is generated; in "
-        "production you buy it in small amounts by having a person check "
-        "documents by hand.  <strong>What was filed</strong> (the proxy, i.e. "
+        "said.  The synthetic demo has generated truth; in production, "
+        "independent human audits provide a reference for a sample.  "
+        "<strong>What was filed</strong> (the proxy, i.e. "
         "our stand-in for the truth): available for every document, but it "
         "arrives days later and it is not quite the truth &mdash; filings get "
         "legitimately corrected after the fact, and sometimes the filing repeats "
@@ -337,6 +350,147 @@ def _regimes_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> s
         "sections down.  The rest of this report scores against what was filed, "
         "because that is all production normally has.</p>"
         f"{table}{disagreement}{audit}</section>"
+    )
+
+
+def _synthetic_review_section(ev: Evaluation, extras: ReportExtras, dd: _Drilldowns) -> str:
+    scenario = extras.synthetic_review
+    if scenario is None:
+        return ""
+    gold = extras.gold_evaluation
+    if gold is None or extras.hidden_errors is None:
+        raise ValueError("synthetic review requires gold and baseline hidden-error comparisons")
+    if (
+        scenario.evaluation.critical_tier != ev.critical_tier
+        or gold.critical_tier != ev.critical_tier
+    ):
+        raise ValueError("synthetic review evaluations must use the same critical tier")
+
+    def header_signature(evaluation: Evaluation) -> pd.DataFrame:
+        columns = [
+            "doc_id", "field", "tier", "extracted_value", "confidence",
+            "comparator", "comparator_version",
+        ]
+        return (
+            evaluation.comparisons.loc[evaluation.comparisons["level"] == "header", columns]
+            .sort_values(["doc_id", "field"])
+            .reset_index(drop=True)
+        )
+
+    def header_comparators(evaluation: Evaluation) -> pd.DataFrame:
+        return (
+            evaluation.per_field.loc[
+                evaluation.per_field["level"] == "header", ["field", "tier", "comparator"]
+            ]
+            .sort_values("field")
+            .reset_index(drop=True)
+        )
+
+    baseline_docs = ev.doc_summary["doc_id"]
+    for other in (scenario.evaluation, gold):
+        other_docs = other.doc_summary["doc_id"]
+        if (
+            not baseline_docs.is_unique or not other_docs.is_unique
+            or set(baseline_docs) != set(other_docs)
+        ):
+            raise ValueError("synthetic review evaluations must cover the same documents")
+        if (
+            not header_signature(ev).equals(header_signature(other))
+            or not header_comparators(ev).equals(header_comparators(other))
+        ):
+            raise ValueError(
+                "synthetic review requires the same extracted headers and "
+                "header comparator settings"
+            )
+
+    def clean_link(evaluation: Evaluation, label: str) -> str:
+        rows = evaluation.comparisons[
+            evaluation.comparisons["tier"] == evaluation.critical_tier
+        ].merge(
+            evaluation.doc_summary[["doc_id", "clean"]],
+            on="doc_id",
+            validate="many_to_one",
+        )
+        rate = evaluation.clean_document_rate
+        text = f"{rate * 100:.1f}%" if not pd.isna(rate) else "not available"
+        return dd.link(
+            text,
+            f"Tier-{evaluation.critical_tier} comparisons: {label}",
+            rows,
+            COMPARISON_COLUMNS + ["comparator", "comparator_version", "clean"],
+        )
+
+    def hidden_link(frame: pd.DataFrame, label: str) -> str:
+        header_rows = frame[frame["level"] == "header"]
+        return dd.link(
+            f"{len(header_rows):,}",
+            f"Wrong header fields hidden by agreement: {label}",
+            header_rows,
+            [
+                "doc_id", "field", "tier", "extracted_value", "filed_value",
+                "gold_value", "status", "reason", "status_gold", "reason_gold",
+                "confidence", "comparator", "comparator_version",
+            ],
+        )
+
+    table = _raw_table(
+        ["measure", "result"],
+        [
+            [
+                (
+                    f"documents with no detected tier-{ev.critical_tier} mismatch "
+                    "vs baseline filing"
+                ),
+                clean_link(ev, "baseline filing"),
+            ],
+            [
+                (
+                    f"documents with no detected tier-{ev.critical_tier} mismatch "
+                    "vs hypothetical filing"
+                ),
+                clean_link(scenario.evaluation, "hypothetical filing"),
+            ],
+            [
+                (
+                    f"documents with no detected tier-{ev.critical_tier} mismatch "
+                    "vs synthetic truth"
+                ),
+                clean_link(gold, "synthetic truth"),
+            ],
+            [
+                "wrong header fields hidden by agreement with baseline filing",
+                hidden_link(extras.hidden_errors, "baseline filing"),
+            ],
+            [
+                "wrong header fields hidden by agreement with hypothetical filing",
+                hidden_link(scenario.hidden_errors, "hypothetical filing"),
+            ],
+        ],
+    )
+    return (
+        "<section><h2>Synthetic demonstration: when review copies an error</h2>"
+        "<p>This is a sensitivity demonstration, <strong>not an observation "
+        "of reviewers</strong>.  For each eligible wrong header value, it "
+        "assumes a probability of "
+        f"{scenario.acceptance_probability * 100:.1f}% that a hypothetical "
+        "reviewer accepts the pre-fill.  It copies those values into a separate "
+        "filing while keeping the extraction and baseline filing unchanged.  "
+        "The synthetic truth identifies the wrong values; changed or "
+        "not-comparable baseline values are left alone, even when a change is "
+        "within a comparison tolerance.  The same comparators score each "
+        "reference.</p>"
+        f"{table}"
+        "<p>A hidden error is a field where extraction matches the filing but "
+        "not the synthetic truth.  Only comparable header fields are simulated; "
+        "the document-level rate includes all configured fields and items.  "
+        "A document with missing or unparseable fields can still have no "
+        "detected mismatch.  This does not model review time, edits to correct "
+        "values, missing fields, goods-item errors, or actual human behaviour.  "
+        "An independent audit and a randomized workflow study are needed to "
+        "measure real quality and usefulness.</p>"
+        f"<p>Synthetic assumption version: {esc(scenario.simulation_version)}.  "
+        "The seed, assumptions, decisions and comparison rows are in the "
+        "synthetic_review folder next to this report.</p></section>"
     )
 
 
@@ -370,11 +524,10 @@ def _leading_indicators_section(ev: Evaluation, extras: ReportExtras, dd: _Drill
         "Until then, the only per-document warning signs are the built-in checks "
         "(validity rules) and the tool's own confidence scores.  This table asks "
         "how good those warnings are: of the documents each sign flags, how many "
-        "turn out to have a serious (tier-1) error, and how does that compare to "
-        "an average document?  The last row is the uncomfortable one: documents "
-        "with no warning sign at all that are wrong anyway.  Made-up-but-"
-        "plausible values &mdash; which look valid and come with high confidence "
-        "&mdash; live almost entirely in that row.</p>"
+        "later disagree with the filed record on a serious (tier-1) field, and "
+        "how does that compare to an average document?  The last row includes "
+        "documents with no warning sign that still disagree with the filing.  "
+        "Errors shared by extraction and filing are invisible here.</p>"
         f"{table}</section>"
     )
 
@@ -390,7 +543,7 @@ def _confidence_quality_section(extras: ReportExtras, dd: _Drilldowns) -> str:
         for s in extras.confidence_summaries
     ]
     summary_table = _raw_table(
-        ["scored against", "fields scored", "actually right", "claimed confidence (avg)",
+        ["scored against", "fields scored", "agree with reference", "claimed confidence (avg)",
          "honesty gap (ECE)", "error score (Brier)", "sorting power (AUROC)"],
         body,
     )
@@ -423,7 +576,7 @@ def _confidence_quality_section(extras: ReportExtras, dd: _Drilldowns) -> str:
             "confidence minus actual hit rate &mdash; above zero means the tool "
             "oversells itself on that field, below zero means it undersells.  "
             "Click a count to see that field's real errors, most confident "
-            "first: those are the ones no review queue would have caught.</p>"
+            "first: a queue that prioritizes low confidence may miss them.</p>"
             + _raw_table(
                 ["field", "level", "fields scored", "actually right",
                  "claimed confidence (avg)", "gap", "sorting power (AUROC)"],
@@ -437,23 +590,19 @@ def _confidence_quality_section(extras: ReportExtras, dd: _Drilldowns) -> str:
         "gap (ECE) is the average distance between what the score claims and "
         "how often the tool is actually right &mdash; 0 is perfect.  The error "
         "score (Brier) measures the same idea but punishes being confidently "
-        "wrong hardest &mdash; again, lower is better.  A dishonest-but-"
-        "consistent score can be repaired: once you know &ldquo;0.9 really "
-        "means 0.8&rdquo;, you relabel it.  <strong>Can it tell right from "
+        "wrong hardest &mdash; again, lower is better.  A consistent score "
+        "may be recalibrated using representative independent labels, then "
+        "checked on separate data.  <strong>Can it tell right from "
         "wrong at all?</strong>  Pick one field the tool got right and one it "
         "got wrong, at random: sorting power (AUROC) is how often the right "
         "one carries the higher score.  1.0 means always &mdash; a threshold "
-        "can cleanly separate them; 0.5 means the score is a coin flip and no "
-        "threshold anywhere will help.  No relabelling can fix poor sorting "
-        "power, and the auto-accept gate relies on it entirely.</p>"
-        "<p>The two rows below score the very same confidence numbers against "
-        "the truth and against what was filed.  Because the filing is an "
-        "imperfect answer key, the score's sorting power reads lower against "
-        "it than it really is &mdash; judge the tool with noisy answers and "
-        "the tool looks worse.  Note also that the fields where made-up "
-        "values were planted are exactly the ones whose sorting power "
-        "collapses in the table below: confident fabrication is what drags "
-        "it down.</p>"
+        "can cleanly separate them; 0.5 means the overall ranking is no better "
+        "than chance, not that every threshold is necessarily useless.  "
+        "Monotonic recalibration cannot improve that ordering.</p>"
+        "<p>Each row is scored against the reference it names.  A filing is an "
+        "imperfect answer key: amendments and shared errors can make apparent "
+        "confidence quality better or worse than quality against independent "
+        "truth.  Use a blinded audit to assess the score in production.</p>"
         f"{summary_table}{per_field}</section>"
     )
 
@@ -543,14 +692,15 @@ def _straight_through_section(ev: Evaluation, dd: _Drilldowns) -> str:
         body,
     )
     return (
-        "<section><h2>What if we let confident documents through unreviewed?</h2>"
+        "<section><h2>Future what-if: confident documents without review</h2>"
         "<p>Each row plays out one policy: accept, without human review, every "
         "document whose most-critical (tier-1) fields all carry at least this "
         "confidence score.  The table shows how much of the workload would go "
-        "straight through and how many bad documents would ride along.  Two "
-        "honest caveats.  Errors are counted against the filed record, so "
-        "legitimate post-filing amendments count as escapes &mdash; the true "
-        "escape rate can only be lower.  And the gate can only see scores that "
+        "straight through and how many would disagree with the filed record.  "
+        "This is not a recommendation to remove current human review.  "
+        "Amendments can create apparent escapes, while errors shared with the "
+        "filing remain hidden, so the true escape rate may be higher or lower.  "
+        "The gate can only see scores that "
         "exist: a document whose extraction silently dropped a goods item still "
         "sails through, because the missing line has no score to be low.  That "
         "is how confidence gates fail in real life.</p>"
@@ -583,7 +733,7 @@ def _calibration_section(ev: Evaluation, dd: _Drilldowns) -> str:
         ])
     table = _raw_table(
         ["confidence band", "fields scored", "matched", "mismatched",
-         "actually right", "average claimed confidence"],
+         "agree with filing", "average claimed confidence"],
         body,
     )
     return (
@@ -592,7 +742,8 @@ def _calibration_section(ev: Evaluation, dd: _Drilldowns) -> str:
         "Here those scores are grouped into ten bands, and for each band we ask: "
         "of the fields the tool scored in this range, how many actually matched "
         "what was filed?  If the score is honest, the 0.9&ndash;1.0 band should "
-        "be right far more often than the 0.6&ndash;0.7 band.  If the rows look "
+        "agree with an independent truth more often than the 0.6&ndash;0.7 band.  "
+        "The filed record is not an independent truth.  If the rows look "
         "the same, the score is decoration and must not be used to decide "
         "anything.</p>"
         f"{table}</section>"
@@ -633,10 +784,10 @@ def _per_field_section(ev: Evaluation, dd: _Drilldowns) -> str:
     return (
         "<section><h2>Per-field precision and recall</h2>"
         "<p>Two questions per field.  <em>Precision</em> &mdash; when the tool "
-        "wrote a value, how often was it the right one?  <em>Recall</em> &mdash; "
+        "wrote a value, how often did it match the filing?  <em>Recall</em> &mdash; "
         "of the values that ended up in the filing, how often did the tool "
         "deliver a matching one?  The difference matters: a field the tool "
-        "left empty doesn't hurt precision (it wrote nothing wrong), but it "
+        "left empty is not included in the precision denominator, but it "
         "does hurt recall (the filing needed a value it never produced).  "
         "Item-level rows count every paired goods item; whole items that "
         "never got paired are counted in the alignment section above, not "
@@ -704,8 +855,9 @@ def _worst_mismatches_section(ev: Evaluation) -> str:
     return (
         "<section><h2>50 worst mismatches</h2>"
         "<p>Worst = lowest tier first (most critical), then highest extraction "
-        "confidence &mdash; a confidently wrong value is more dangerous than a "
-        "hesitantly wrong one, because no review queue will catch it.  Missed "
+        "confidence &mdash; a confidently wrong value may not be prioritized "
+        "by a queue that relies on low confidence.  These are mismatches "
+        "against the filing, not proven extraction errors.  Missed "
         "and spurious items carry no confidence, so they sort to the end of "
         "their tier here; the alignment section lists them all.</p>"
         f"{_table(worst, COMPARISON_COLUMNS)}</section>"
@@ -750,21 +902,25 @@ def _caveats_section(extra_notes: list[str] | None, has_gold: bool = False) -> s
     ]
     if has_gold:
         notes.append(
-            "The gold columns exist only because this data is synthetic.  In "
-            "production the gold regime is a periodically drawn, human-graded "
-            "audit sample &mdash; see the audit table above for what its "
-            "precision costs."
+            "Gold needs an independent reference.  In the synthetic demo it "
+            "comes from the generator; production needs a blinded, human-graded "
+            "audit sample and an assessment of its coverage and uncertainty."
         )
     notes += [
         "The filed record is <strong>not the truth</strong>.  Documents get "
         "legitimately amended after filing (revaluations, corrected counts, "
-        "reclassifications), and those amendments appear here as extraction "
-        "mismatches.  Nothing in this report can tell the two apart, so every "
-        "mismatch count is a ceiling &mdash; the tool's true error rate can "
-        "only be lower, not higher.",
+        "reclassifications), and those amendments can appear as extraction "
+        "mismatches.  A reviewer may also accept a wrong pre-filled value, "
+        "hiding an error that extraction and filing share.  Filing-based "
+        "mismatch counts are not guaranteed upper or lower bounds on true error.",
         "When extraction and filing agree, they can both be wrong.  Agreement "
-        "measures consistency, not correctness; only the validity rules catch "
-        "some of these cases.",
+        "measures consistency, not correctness.  Validity rules can flag some "
+        "cases; an independent audit is needed for errors the rules cannot see.",
+        (
+            "Missing or unparseable values are not comparable, not matches.  They "
+            "are not counted as mismatches in the clean-document headline, so a "
+            "clean result does not prove that every critical value was present."
+        ),
         "Item pairing is a best guess, not a fact.  Two similar goods lines "
         "can pair the wrong way round, and a merged line whose totals happen "
         "to equal one filed item pairs cleanly while the other filed item is "
@@ -975,10 +1131,10 @@ def _head_to_head_section(
     return (
         f"<section><h2>Head to head: {esc(h.model_a)} vs {esc(h.model_b)}</h2>"
         "<p>Both models saw the same documents, so each document can be scored "
-        "as a small contest.  This is far more decisive than comparing two "
-        "overall rates: documents both models get right, both get wrong, or "
-        "that were amended after filing land in the agreeing rows and cancel "
-        "out &mdash; the disagreement rows are the actual evidence.  Click a "
+        "as a small contest.  Documents where both models have the same verdict "
+        "cancel out of the rate difference.  An amendment can affect the models "
+        "differently, and a filing influenced by one model can bias the result; "
+        "pairing does not make the reference independent.  Click a "
         "win count to see exactly why the losing model failed those "
         "documents.</p>"
         f"{table}<p>{verdict}</p>{gold_note}</section>"
@@ -1076,10 +1232,9 @@ def _comparison_caveats(
         "Per-model depth (built-in checks, confidence bands, country "
         "breakdowns) lives in each model's own full report; this page only "
         "compares.",
-        "The overall rates inherit every caveat of the reference they were "
-        "scored against &mdash; but the head-to-head is largely immune to "
-        "amendment noise, because an amended filing trips both models "
-        "equally and cancels out of the disagreement rows.",
+        "The overall rates and head-to-head comparison inherit the caveats "
+        "of their reference.  Amendments may affect the models differently; "
+        "a filing influenced by one model may also favor that model.",
     ]
     items = "".join(f"<li>{note}</li>" for note in notes)
     return (
@@ -1164,6 +1319,7 @@ def build_report(
     sections = [
         _headline(evaluation, dd, extras),
         _regimes_section(evaluation, extras, dd),
+        _synthetic_review_section(evaluation, extras, dd),
         _alignment_section(evaluation, dd),
         _straight_through_section(evaluation, dd),
         _leading_indicators_section(evaluation, extras, dd),
