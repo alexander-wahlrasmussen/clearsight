@@ -3,7 +3,9 @@
 Prototype that measures how accurate automated customs-document extraction
 is, by comparing extracted records against the downstream filing system
 (and, for synthetic data, against the generated truth).  Read README.md
-first — it explains the design decisions and has a plain-English glossary.
+first for the project framing. Detailed design decisions are in
+docs/methodology.md and docs/architecture.md; the plain-English glossary
+is in docs/reference.md.
 
 ## Commands
 
